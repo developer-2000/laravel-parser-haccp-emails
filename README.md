@@ -25,7 +25,7 @@ docker compose -f dev-compose.yml exec app php artisan migrate:fresh --seed
 docker compose -f dev-compose.yml ps
 docker compose -f dev-compose.yml exec queue php artisan horizon:status
 
-После изменений в Job
+## После изменений в Job
 docker compose -f dev-compose.yml restart queue
  - Рестарт Horizon (после деплоя джобов)
 docker compose -f dev-compose.yml exec redis redis-cli FLUSHALL

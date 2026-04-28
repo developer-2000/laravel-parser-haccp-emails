@@ -68,6 +68,19 @@ class CrawlJob implements ShouldQueue
         }
 
         /**
+         * STEP 1.6 — Lead scoring (Tier 3).
+         * Подсчёт сигналов "промышленный мясной производитель" vs "розничный/HoReCa".
+         * Порог низкий (<3), чтобы не зарезать хороших.
+         */
+        $score = $this->calculateLeadScore($html);
+        $logger->write("LEAD SCORE: {$score} {$this->url}", 'crawl.log');
+
+        if ($score < 3) {
+            $logger->write("LOW SCORE DROP: {$this->url}", 'crawl.log');
+            return;
+        }
+
+        /**
          * STEP 2:
          * извлечение базовых данных с главной страницы
          */
@@ -105,6 +118,28 @@ class CrawlJob implements ShouldQueue
         if ($contactHtml) {
             $emails = array_merge($emails, $this->extractEmails($contactHtml));
             $phones = array_merge($phones, $this->extractPhones($contactHtml));
+        }
+
+        /**
+         * STEP 5.5:
+         * поиск контактных ссылок в меню главной страницы.
+         *
+         * Зачем: CMS типа typo3/joomla с pageid-навигацией отдают контакты
+         * по нестандартным URL вроде /index.php?pageid=11, и шаблонные
+         * /impressum/ + /kontakt/ выше дадут 404. Здесь читаем <a href>
+         * с текстом ссылки = Kontakt/Contact/Impressum/Anfahrt и идём
+         * прямо по найденному URL (только same-domain, дедуп).
+         *
+         * Пример (fleischer-proesch.de): меню "Kontakt" → ?pageid=11.
+         */
+        $menuLinks = $this->extractMenuContactLinks($html, $this->url);
+        foreach ($menuLinks as $menuUrl) {
+            $menuHtml = $this->fetch($menuUrl);
+            if (!$menuHtml) {
+                continue;
+            }
+            $emails = array_merge($emails, $this->extractEmails($menuHtml));
+            $phones = array_merge($phones, $this->extractPhones($menuHtml));
         }
 
         /**
@@ -483,5 +518,176 @@ class CrawlJob implements ShouldQueue
         $regex = '/' . implode('|', array_map('preg_quote', $patterns)) . '/i';
 
         return (bool) preg_match($regex, $title);
+    }
+
+    /**
+     * STEP H — Lead scoring (Tier 3 классификации).
+     *
+     * Считает баллы по сигналам в тексте страницы:
+     *   - +2 за каждое позитивное слово (производство, HACCP, IFS, и т.д.)
+     *   - -3 за каждое негативное слово (restaurant, online shop, lieferservice)
+     *
+     * Возвращает число; в handle() сравнивается с порогом (<3 = drop).
+     * Порог намеренно низкий — лучше пропустить шум, чем зарезать реального производителя.
+     */
+    private function calculateLeadScore(string $html): int
+    {
+        $score = 0;
+        $text = mb_strtolower(strip_tags($html));
+
+        // INDUSTRIAL POSITIVE — признаки промышленного производителя.
+        $positive = [
+            'produktion',
+            'herstellung',
+            'verarbeitung',
+            'werk',
+            'fabrik',
+            'lebensmittelproduktion',
+            'fleischwaren',
+            'haccp',
+            'ifs',
+            'brc',
+            'iso 22000',
+            'qualitätsmanagement',
+            'lebensmittelsicherheit',
+        ];
+        foreach ($positive as $word) {
+            if (str_contains($text, $word)) {
+                $score += 2;
+            }
+        }
+
+        // RETAIL NEGATIVE — розница / HoReCa, не наш target.
+        $negative = [
+            'restaurant',
+            'imbiss',
+            'cafe',
+            'speisekarte',
+            'online shop',
+            'warenkorb',
+            'bestellen',
+            'lieferservice',
+            'takeaway',
+        ];
+        foreach ($negative as $word) {
+            if (str_contains($text, $word)) {
+                $score -= 3;
+            }
+        }
+
+        return $score;
+    }
+
+    /**
+     * STEP I — поиск контактных ссылок в меню главной страницы.
+     *
+     * Парсит все <a href="X">Y</a>, фильтрует по тексту ссылки Y
+     * (Kontakt / Contact / Impressum / Anfahrt / Standort), резолвит
+     * относительные href в абсолютные URL и оставляет только same-domain.
+     *
+     * Дедуп — по абсолютному URL. Лимит 5 ссылок, чтоб не зацикливаться
+     * на сайтах, где "Kontakt" встречается в каждом блоке (footer, header,
+     * sidebar часто дублируют ссылку).
+     *
+     * Возвращает массив абсолютных URL.
+     */
+    private function extractMenuContactLinks(string $html, string $baseUrl): array
+    {
+        $keywords = ['kontakt', 'contact', 'impressum', 'anfahrt', 'standort'];
+
+        if (!preg_match_all(
+            '/<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)<\/a>/is',
+            $html,
+            $matches,
+            PREG_SET_ORDER
+        )) {
+            return [];
+        }
+
+        $baseHost = parse_url($baseUrl, PHP_URL_HOST);
+        $links = [];
+
+        foreach ($matches as $m) {
+            $text = mb_strtolower(trim(html_entity_decode(strip_tags($m[2]))));
+            if ($text === '') {
+                continue;
+            }
+
+            $matched = false;
+            foreach ($keywords as $kw) {
+                // \b-граница, чтобы "kontaktformular" тоже ловился, но не цеплять рандомные подстроки
+                if (preg_match('/\b' . preg_quote($kw, '/') . '/u', $text)) {
+                    $matched = true;
+                    break;
+                }
+            }
+            if (!$matched) {
+                continue;
+            }
+
+            $abs = $this->absoluteUrl($m[1], $baseUrl);
+            if (!$abs) {
+                continue;
+            }
+
+            // только same-domain (отсеиваем ссылки на facebook/google maps/и т.п.)
+            if (parse_url($abs, PHP_URL_HOST) !== $baseHost) {
+                continue;
+            }
+
+            $links[$abs] = true;
+            if (count($links) >= 5) {
+                break;
+            }
+        }
+
+        return array_keys($links);
+    }
+
+    /**
+     * STEP J — резолв относительного href в абсолютный URL.
+     *
+     * Поддерживает:
+     *   - http(s):// — возвращаем как есть
+     *   - //host/path — добавляем схему base
+     *   - /path — добавляем origin base
+     *   - relative/path — клеим к директории base
+     *
+     * Отсекаем нерелевантные схемы: mailto:, tel:, javascript:, #anchor.
+     */
+    private function absoluteUrl(string $href, string $base): ?string
+    {
+        $href = trim($href);
+        if ($href === '' || $href[0] === '#') {
+            return null;
+        }
+        if (preg_match('/^(mailto:|tel:|javascript:)/i', $href)) {
+            return null;
+        }
+        if (preg_match('#^https?://#i', $href)) {
+            return $href;
+        }
+
+        $parts = parse_url($base);
+        if (!$parts || !isset($parts['scheme'], $parts['host'])) {
+            return null;
+        }
+        $origin = $parts['scheme'] . '://' . $parts['host'];
+
+        if (str_starts_with($href, '//')) {
+            return $parts['scheme'] . ':' . $href;
+        }
+        if (str_starts_with($href, '/')) {
+            return $origin . $href;
+        }
+
+        // относительный путь — клеим к директории base
+        $path = $parts['path'] ?? '/';
+        if (!str_ends_with($path, '/')) {
+            $pos = strrpos($path, '/');
+            $path = $pos !== false ? substr($path, 0, $pos + 1) : '/';
+        }
+
+        return $origin . $path . $href;
     }
 }

@@ -64,76 +64,65 @@ class SearchJob implements ShouldQueue
         try {
             sleep(rand(1, 2));
 
-            // Первая итерация — bare search. Последующие — POST формы Next из предыдущей страницы.
-            if ($this->iteration === 0 || $this->nextPageParams === null) {
-                $logger->write("[req] mode=search (first page)", 'search.log');
-                $html = $playwright->search($this->query);
-            } else {
-                $sParam = $this->nextPageParams['s'] ?? '?';
-                $logger->write("[req] mode=nextPage s={$sParam}", 'search.log');
-                $html = $playwright->nextPage($this->nextPageParams);
-            }
+            // 1 Получение HTML страницы выдачи DuckDuckGo для текущей итерации.
+            $html = $this->fetchSerpHtml($playwright, $logger);
 
             $bytes = strlen($html);
             $logger->write("[2] bytes={$bytes}", 'search.log');
 
-            file_put_contents(
-                storage_path("logs/ddg-iteration-{$this->iteration}.html"),
-                $html
-            );
-
+            // ERROR - Проверка валидности ответа DuckDuckGo:
+            // bytes < 5000 → ответ слишком короткий, чтобы быть нормальной
+            // str_contains('captcha') → DDG отдал страницу с защитой от ботов
+            // В обоих случаях бросаем BLOCK_OR_EMPTY — внешний catch в handle()
+            // запустит retry с задержкой (до 3 попыток).
             if ($bytes < 5000 || str_contains($html, 'captcha')) {
                 throw new \Exception('BLOCK_OR_EMPTY');
             }
 
-            // Извлечение и фильтрация ссылок с подробным логом каждого шага.
+            // 2 Извлечение url сайтов из SERP + 3-уровневая дедупликация.
             $newLinks = $this->extractAndDedupe($html, $logger);
 
+            // STOP
             if (count($newLinks) === 0) {
                 $logger->write("[STOP] no new links after dedup", 'search.log');
                 return;
             }
 
             $dispatched = 0;
+            // 3 Ставим новую задачу в очередь - откроет сайт, извлечёт данные и сохранит контакты в DB
             foreach ($newLinks as $link) {
-//                $logger->write('[v link] ' . $link, 'search.log');
-
-                // В БД не пишем — это делает CrawlJob после off-topic фильтра.
-                // Dedup между итерациями частично работает через Company::whereIn выше
-                // (по уже сохранённым CrawlJob'ом записям). Возможные дубли диспатча
-                // безопасны: Company::updateOrCreate в CrawlJob идемпотентна по unique-индексу url.
                 CrawlJob::dispatch($link)->onQueue('crawl');
+
                 $dispatched++;
             }
 
             $logger->write("[3] dispatched={$dispatched}", 'search.log');
 
-            // Извлекаем форму Next из текущей страницы для следующей итерации.
-            $nextPageParams = $this->extractNextPageParams($html);
-
-            if ($nextPageParams === null) {
-                $logger->write("[next-page] not found — последняя страница выдачи, STOP", 'search.log');
-                return;
-            }
-
-            $logger->write(
-                "[next-page] found s={$nextPageParams['s']} keys=" . implode(',', array_keys($nextPageParams)),
-                'search.log'
-            );
-
-            self::dispatch(
-                $this->querySetId,
-                $this->query,
-                $this->iteration + 1,
-                0,
-                $nextPageParams
-            )
-                ->delay(now()->addSeconds(rand(2, 5)))
-                ->onQueue('search');
+            // 4 Планируем следующую итерацию (если в выдаче есть следующая страница)
+            $this->scheduleNextIteration($html, $logger);
 
         } catch (\Throwable $e) {
             $logger->write("[ERROR] {$e->getMessage()} retry={$this->retry}", 'search.log');
 
+            /**
+             * Retry-механизм при сбое итерации.
+             *
+             * Зачем:
+             *   - DDG может временно отдать captcha, обрезанный ответ или
+             *     уронить Playwright по timeout — это не «фатальные» ошибки,
+             *     при повторе через несколько секунд обычно проходит.
+             *
+             * Что делаем:
+             *   - До 3 повторов на одну и ту же итерацию (retry=0 → 1 → 2 → 3).
+             *   - Переписпатчим тот же SearchJob с теми же параметрами
+             *     (querySetId, query, iteration, nextPageParams), но с retry+1.
+             *   - Задержка 3–8 секунд — чтобы не долбить DDG сразу после блока.
+             *   - return — выходим из handle, новая попытка пойдёт уже как
+             *     отдельный job из очереди.
+             *
+             * Если retry достиг 3 — попадаем дальше в [FAIL] лог
+             * и больше не пытаемся.
+             */
             if ($this->retry < 3) {
                 self::dispatch(
                     $this->querySetId,
@@ -153,54 +142,273 @@ class SearchJob implements ShouldQueue
     }
 
     /**
-     * Извлечение ссылок + 3-уровневая дедупликация с логами на каждом шаге.
+     * Получение HTML страницы выдачи DuckDuckGo для текущей итерации.
+     *
+     * Выбор режима запроса:
+     *
+     *   - Первая итерация (iteration === 0) или нет данных пагинации
+     *     → bare search: открываем DDG /html/ с параметром q.
+     *
+     *   - Все следующие итерации → берём hidden-поля формы Next,
+     *     полученные из предыдущей страницы выдачи (q, s, dc, v, o,
+     *     api и т.д.), и POST'им их обратно в DDG как продолжение
+     *     пагинации. Параметр `s` — смещение результатов (offset),
+     *     по нему DDG понимает, какую страницу отдать.
+     *
+     * Сам HTTP-запрос идёт через Playwright (headless-браузер),
+     * чтобы пройти JS-проверки DDG и не словить captcha.
+     */
+    private function fetchSerpHtml(PlaywrightService $playwright, AppLogger $logger): string
+    {
+        // mode выбираем заранее, чтобы то же значение использовать и в логе ошибки
+        $mode = ($this->iteration === 0 || $this->nextPageParams === null) ? 'search' : 'nextPage';
+
+        try {
+            if ($mode === 'search') {
+                // первая страница выдачи — обычный поиск по строке запроса
+                return $playwright->search($this->query);
+            }
+
+            // следующая страница — переиспользуем форму Next предыдущей итерации
+            $sParam = $this->nextPageParams['s'] ?? '?';
+            return $playwright->nextPage($this->nextPageParams);
+        }
+        catch (\Throwable $e) {
+            $this->logPlaywrightError($logger, $mode, $e);
+            // прокидываем дальше — handle() поймает и сделает retry по своей логике
+            throw $e;
+        }
+    }
+
+    /**
+     * Запись подробного лога ошибки Playwright в отдельный файл playwright_errors.log.
+     *
+     * Что попадает в запись:
+     *   - время (добавляет AppLogger автоматически)
+     *   - что делали (mode = search | nextPage)
+     *   - у кого (querySetId, query, iteration, retry)
+     *   - что произошло (класс исключения, сообщение, файл и строка, stack trace)
+     *   - параметры пагинации, если упал nextPage (для воспроизведения)
+     */
+    private function logPlaywrightError(AppLogger $logger, string $mode, \Throwable $e): void
+    {
+        $payload = [
+            'event'         => 'playwright_failure',
+            'mode'          => $mode,
+            'querySetId'    => $this->querySetId,
+            'query'         => $this->query,
+            'iteration'     => $this->iteration,
+            'retry'         => $this->retry,
+            'nextPageParams' => $this->nextPageParams,
+            'exception' => [
+                'class'   => get_class($e),
+                'message' => $e->getMessage(),
+                'file'    => $e->getFile(),
+                'line'    => $e->getLine(),
+            ],
+            'trace' => $e->getTraceAsString(),
+        ];
+
+        $logger->write($payload, 'playwright_errors.log');
+    }
+
+    /**
+     * Планирование следующей итерации обхода выдачи.
+     *
+     * Что делает:
+     *   - Парсит из текущего HTML hidden-поля формы Next (q, s, dc, v, o, api…).
+     *   - Если формы нет → это последняя страница выдачи, тихо завершаемся.
+     *   - Если форма есть → диспатчит SearchJob с iteration+1 и параметрами
+     *     пагинации, retry сбрасывается в 0, очередь search, задержка 2–5 сек
+     *     (чтобы не долбить DDG плотным потоком).
+     */
+    private function scheduleNextIteration(string $html, AppLogger $logger): void
+    {
+        $nextPageParams = $this->extractNextPageParams($html);
+
+        if ($nextPageParams === null) {
+            $logger->write("[next-page] not found — последняя страница выдачи, STOP", 'search.log');
+            return;
+        }
+
+        $logger->write(
+            "[next-page] found s={$nextPageParams['s']} keys=" . implode(',', array_keys($nextPageParams)),
+            'search.log'
+        );
+
+        self::dispatch(
+            $this->querySetId,
+            $this->query,
+            $this->iteration + 1,
+            0,
+            $nextPageParams
+        )
+            ->delay(now()->addSeconds(rand(2, 5)))
+            ->onQueue('search');
+    }
+
+    /**
+     * Извлечение ссылок из SERP + 3-уровневая дедупликация.
+     *
+     * Pipeline:
+     *   raw → normalized → unique-in-batch → after-trash → new-unique (vs DB)
+     *
+     * Каждый шаг логирует свой счётчик в search.log, чтобы в логе было видно,
+     * на каком этапе сколько ссылок отвалилось.
      */
     private function extractAndDedupe(string $html, AppLogger $logger): array
     {
+        // 0. достаём сырые ссылки из HTML выдачи DuckDuckGo
         $rawLinks = $this->extractLinksSERP($html);
         $logger->write('[raw] count=' . count($rawLinks), 'search.log');
 
+        // выдача пустая — дальше делать нечего
         if (empty($rawLinks)) {
             return [];
         }
 
-        // 1. дедуп within batch (на странице DDG может вернуть один URL дважды).
-        $unique = array_values(array_unique($rawLinks));
-//        $logger->write('[unique-in-batch] count=' . count($unique) . ' duplicates=' . (count($rawLinks) - count($unique)), 'search.log');
+        // 1. приводим каждый URL к scheme://host (убираем path/query/fragment)
+        $normalized = $this->normalizeBatch($rawLinks, $logger);
+        // 2. схлопываем дубли url внутри текущей пачки
+        $unique     = $this->dedupeInBatch($normalized, $logger);
+        // 3. отсекаем мусорные домены/пути (магазины, оборудование, агрегаторы)
+        $afterTrash = $this->filterTrash($unique, $logger);
+        // 4. отсеиваем то, что уже сохранено в БД, и возвращаем только новые URL
+        return $this->dedupeAgainstDb($afterTrash, $logger);
+    }
 
-        // 2. фильтр trash-URL (домены магазинов, пути оборудования, агрегаторы, документы).
-        $afterTrash = [];
+    /**
+     * Шаг 1 — нормализация URL до канонической формы scheme://host.
+     *
+     * Зачем: без этого "site.de/impressum/", "site.de/kontakt/" и "site.de/"
+     * попадут в БД как 3 разные компании.
+     *
+     * www оставляем как есть — иногда www.site.de и site.de реально разные
+     * (отдельные SSL/redirect, разные сайты).
+     */
+    private function normalizeBatch(array $rawLinks, AppLogger $logger): array
+    {
+        $normalized = array_values(array_filter(array_map(
+            fn($url) => $this->normalizeUrl($url),
+            $rawLinks
+        )));
+
+        $logger->write('[normalized] count=' . count($normalized), 'search.log');
+
+        return $normalized;
+    }
+
+    /**
+     * Шаг 2 — дедуп внутри текущего батча.
+     *
+     * После нормализации схлопываются варианты impressum/kontakt/root одного домена.
+     */
+    private function dedupeInBatch(array $normalized, AppLogger $logger): array
+    {
+        $unique = array_values(array_unique($normalized));
+        $merged = count($normalized) - count($unique);
+
+        $logger->write('[unique-in-batch] count=' . count($unique) . " merged={$merged}", 'search.log');
+
+        return $unique;
+    }
+
+    /**
+     * Шаг 3 — фильтр мусорных URL: магазины, оборудование, агрегаторы, документы, ассоциации.
+     *
+     * Сами правила см. в isTrashUrl(). В лог отдельно пишется список отброшенных,
+     * чтобы было видно, какие домены отсеялись.
+     */
+    private function filterTrash(array $links, AppLogger $logger): array
+    {
+        $clean = [];
         $trashed = [];
-        foreach ($unique as $link) {
+
+        foreach ($links as $link) {
             if ($this->isTrashUrl($link)) {
                 $trashed[] = $link;
                 continue;
             }
-            $afterTrash[] = $link;
+            $clean[] = $link;
         }
-        if (count($trashed) > 0) {
-            $logger->write('[trashed] count=' . count($trashed) . ' list=' . json_encode($trashed, JSON_UNESCAPED_SLASHES), 'search.log');
-        }
-        $logger->write('[after-trash] count=' . count($afterTrash), 'search.log');
 
-        // 3. batch-дедуп с БД (один запрос на все, не N).
-        $existingInDb = Company::whereIn('url', $afterTrash)->pluck('url')->toArray();
+        if ($trashed) {
+            $logger->write(
+                '[trashed] count=' . count($trashed) . ' list=' . json_encode($trashed, JSON_UNESCAPED_SLASHES),
+                'search.log'
+            );
+        }
+        $logger->write('[after-trash] count=' . count($clean), 'search.log');
+
+        return $clean;
+    }
+
+    /**
+     * Шаг 4 — дедуп с БД: одним запросом проверяем, какие URL уже сохранены ранее.
+     *
+     * Один SELECT WHERE IN на всю пачку — не N запросов по одному.
+     * Дубликаты тоже логируются списком — для разбора, что приходит повторно.
+     */
+    private function dedupeAgainstDb(array $links, AppLogger $logger): array
+    {
+        if (empty($links)) {
+            $logger->write('[new-unique] count=0', 'search.log');
+            return [];
+        }
+
+        $existing = Company::whereIn('url', $links)->pluck('url')->toArray();
 
         $newLinks = [];
-        $dbDuplicates = [];
-        foreach ($afterTrash as $link) {
-            if (in_array($link, $existingInDb, true)) {
-                $dbDuplicates[] = $link;
+        $duplicates = [];
+
+        foreach ($links as $link) {
+            if (in_array($link, $existing, true)) {
+                $duplicates[] = $link;
                 continue;
             }
             $newLinks[] = $link;
         }
-        if (count($dbDuplicates) > 0) {
-            $logger->write('[db-duplicates] count=' . count($dbDuplicates) . ' list=' . json_encode($dbDuplicates, JSON_UNESCAPED_SLASHES), 'search.log');
+
+        if ($duplicates) {
+            $logger->write(
+                '[db-duplicates] count=' . count($duplicates) . ' list=' . json_encode($duplicates, JSON_UNESCAPED_SLASHES),
+                'search.log'
+            );
         }
         $logger->write('[new-unique] count=' . count($newLinks), 'search.log');
 
         return $newLinks;
+    }
+
+    /**
+     * Нормализация URL до канонической формы scheme://host.
+     *
+     * Цель: схлопнуть варианты типа site.de/impressum/, site.de/kontakt/, site.de/?q=foo
+     * в единый "site.de" — иначе один производитель попадает в БД 3+ раза по разным URL.
+     *
+     * Что делает:
+     *   - оставляет только scheme + host (без path, query, fragment)
+     *   - host приводит к нижнему регистру (DNS case-insensitive)
+     *   - убирает trailing dot ("example.de." → "example.de")
+     *
+     * Что НЕ делает (намеренно):
+     *   - не убирает www. — www.site.de и site.de могут быть разными ресурсами
+     *     (разные SSL-сертификаты, отдельные редиректы, в крайнем случае разные сайты).
+     *
+     * @return string|null null если URL невалидный (нет host)
+     */
+    private function normalizeUrl(string $url): ?string
+    {
+        $parts = parse_url(trim($url));
+
+        if (!isset($parts['host'])) {
+            return null;
+        }
+
+        $scheme = $parts['scheme'] ?? 'https';
+        $host = rtrim(strtolower($parts['host']), '.');
+
+        return $scheme . '://' . $host;
     }
 
     /**
