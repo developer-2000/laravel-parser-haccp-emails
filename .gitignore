@@ -33,3 +33,6 @@ desktop.ini
 *.swp
 *.swo
 *~
+
+# Project specific
+help.txt

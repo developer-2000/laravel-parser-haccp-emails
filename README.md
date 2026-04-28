@@ -1,9 +1,5 @@
 # parser-emails
 
-Laravel 10 + Docker — dev-окружение для распределённого парсера писем/лидов.
-
----
-
 ## Быстрый старт
 
 Подробные команды Docker:
@@ -15,20 +11,33 @@ Laravel 10 + Docker — dev-окружение для распределённо
 Поднять окружение:
 
 ```bash
+docker compose -f dev-compose.yml build --no-cache app
 docker compose -f dev-compose.yml up -d
+
+docker compose -f dev-compose.yml down
+
+docker compose -f dev-compose.yml exec app npm run dev
+docker compose -f dev-compose.yml exec app npm run build
+
+docker compose -f dev-compose.yml exec app php artisan migrate:fresh --seed
 ```
+
+docker compose -f dev-compose.yml ps
+docker compose -f dev-compose.yml exec queue php artisan horizon:status
+
+После изменений в Job
+docker compose -f dev-compose.yml restart queue
+ - Рестарт Horizon (после деплоя джобов)
+docker compose -f dev-compose.yml exec redis redis-cli FLUSHALL
+ - Полная очистка Redis
+docker compose -f dev-compose.yml exec app php artisan tinker
+app(\App\Services\QueryBuilderService::class)->searchQuery(1);
+
 
 Открыть в браузере:
 - [Главная Laravel](http://localhost:8080)
 - [phpMyAdmin](http://localhost:8081)
 - [UI очередей Horizon](http://localhost:8080/horizon)
-
-
-Остановить:
-
-```bash
-docker compose -f dev-compose.yml down
-```
 
 ## Стек
 
@@ -236,7 +245,7 @@ docker compose -f dev-compose.yml exec queue php artisan horizon:terminate
 
 ```env
 DB_HOST=db
-DB_DATABASE=laravel
+DB_DATABASE=parser_haccp
 DB_USERNAME=root
 DB_PASSWORD=root
 REDIS_HOST=redis
@@ -266,3 +275,163 @@ QUEUE_CONNECTION=redis
 
 - внутри одного контейнера — увеличить `maxProcesses` в `config/horizon.php`
 - горизонтально — `docker compose -f dev-compose.yml up -d --scale queue=N`
+
+---
+
+## Как работают очереди
+
+### Картина целиком
+
+```
+.env                     QUEUE_CONNECTION=redis
+   ↓
+Redis (контейнер redis)  хранит сами джобы по ключам queues:search, queues:crawl, ...
+   ↑
+Horizon (контейнер queue)  читает Redis, держит N воркеров на каждую очередь, перезапускает упавшие
+   ↑
+Твой код                 SearchJob::dispatch(...)->onQueue('search') кладёт джобу в Redis
+```
+
+Главное:
+
+- **Воркеры всегда крутятся** (контейнер `queue` запускается с `php artisan horizon`). Самому `queue:work` дёргать не нужно никогда.
+- **Dispatch = постановка на выполнение.** Как только `dispatch` отработал — джоба в Redis, воркер её подхватит сам в течение долей секунды. Дополнительной "команды на запуск" не существует.
+- **Горизонт держит код в памяти.** Любая правка в `app/Jobs/*`, `app/Services/*`, `app/Models/*` требует `docker compose -f dev-compose.yml restart queue`. Иначе воркер выполнит старый код.
+
+### Точка входа в пайплайн
+
+Артизан-команды для старта **нет**. Точка входа — метод сервиса:
+
+```php
+app(\App\Services\QueryBuilderService::class)->searchQuery($querySetId);
+```
+
+Что он делает:
+
+1. Собирает строку запроса по `QuerySet` (`query_ids` + `group_ids` + `exclude_ids`).
+2. Диспатчит `SearchJob` в очередь `search` с готовой строкой.
+3. Возвращает строку запроса (для UI-превью).
+
+Дальше Horizon крутит цепочку сам:
+
+```
+QueryBuilderService::searchQuery($id)
+        ↓ dispatch
+[ search ]  SearchJob   → парсит выдачу Google
+                        → CrawlJob::dispatch на каждую новую ссылку
+                        → self::dispatch для следующей страницы (до countPage)
+        ↓ dispatch
+[ crawl  ]  CrawlJob    → обходит один сайт
+        ↓
+[ classify ] [ enrich ] [ save ]   ← добавляются по мере реализации
+```
+
+### Способы дёрнуть точку входа
+
+**Tinker (для проверки руками):**
+
+```bash
+docker compose -f dev-compose.yml exec app php artisan tinker
+```
+
+```php
+app(\App\Services\QueryBuilderService::class)->searchQuery(1);
+```
+
+**Через HTTP (для UI / Postman):** добавить роут в [routes/web.php](routes/web.php) или [routes/api.php](routes/api.php), вызвать `searchQuery($id)` в контроллере, вернуть строку запроса в ответе.
+
+### Как посмотреть, что в очереди
+
+**Horizon UI** — [http://localhost:8080/horizon/dashboard](http://localhost:8080/horizon/dashboard):
+
+- Блок **Current Workload** — таблица с колонкой `Jobs` (= pending) и `Processes` (= сколько воркеров жрут эту очередь).
+- Меню **Pending Jobs** — список ждущих в очереди.
+- Меню **Failed Jobs** — упавшие. **Сюда смотри в первую очередь, если "стоит и не выполняется".**
+
+**Redis напрямую** (быстрее всего, не врёт):
+
+```bash
+docker compose -f dev-compose.yml exec redis redis-cli LLEN queues:search
+docker compose -f dev-compose.yml exec redis redis-cli LLEN queues:crawl
+docker compose -f dev-compose.yml exec redis redis-cli --scan --pattern "queues:*"
+```
+
+`LLEN` = сколько джобов лежит в очереди и ждёт. Если `0`, а в Horizon UI на этой очереди тоже `Jobs: 0` — джоба либо уже отработана, либо вообще не была положена (см. ниже).
+
+**CLI Horizon:**
+
+```bash
+docker compose -f dev-compose.yml exec queue php artisan horizon:status   # running / paused / inactive
+docker compose -f dev-compose.yml exec queue php artisan horizon:list     # все supervisor'ы и воркеры
+```
+
+### Если джоба "стоит и не выполняется"
+
+Идти по этому чек-листу сверху вниз — почти всегда падает на одном из шагов:
+
+**1. Джоба вообще попала в Redis?**
+
+```bash
+docker compose -f dev-compose.yml exec redis redis-cli LLEN queues:search
+```
+
+Если `0` сразу после `dispatch` — `QUEUE_CONNECTION` не `redis`. Проверь:
+
+```php
+// в tinker
+config('queue.default');   // должно вернуть "redis"
+```
+
+Если вернуло `sync` — конфиг закэширован старый:
+
+```bash
+docker compose -f dev-compose.yml exec app php artisan config:clear
+```
+
+**2. Воркер этой очереди жив?**
+
+В Horizon UI → Current Workload → у `search` должно быть `Processes ≥ 1`. Если `0` — Horizon упал/перезагружается:
+
+```bash
+docker compose -f dev-compose.yml logs --tail=100 queue
+docker compose -f dev-compose.yml restart queue
+```
+
+**3. Джоба падает с exception?**
+
+Horizon UI → **Failed Jobs**. Открой запись — увидишь stack trace. Самые частые причины:
+
+- `Base table or view not found: 'companies'` — забыл накатить миграцию:
+  ```bash
+  docker compose -f dev-compose.yml exec app php artisan migrate
+  ```
+- `Class App\Jobs\SearchJob not found` или другой class-not-found — воркер держит старый код. Рестарт:
+  ```bash
+  docker compose -f dev-compose.yml restart queue
+  ```
+- Сетевые ошибки на Google — это норма, сработает retry (`tries = 3` в [config/horizon.php](config/horizon.php)).
+
+**4. Воркер видит, но не подхватывает?**
+
+Очень редкий случай — обычно несовпадение имени очереди в `dispatch(...)->onQueue('X')` и в `config/horizon.php`. Очереди должны совпадать буква-в-букву: `search`, `crawl`, `classify`, `enrich`, `save`.
+
+### Полный сброс
+
+Если очереди забились мусором и хочется начать с нуля:
+
+```bash
+docker compose -f dev-compose.yml exec redis redis-cli FLUSHALL
+docker compose -f dev-compose.yml restart queue
+```
+
+`FLUSHALL` сносит всё в Redis: pending-джобы, failed-джобы, метрики Horizon. Для dev это нормально, на проде так не делать.
+
+### TL;DR
+
+| Хочу                          | Делаю                                                                  |
+|-------------------------------|------------------------------------------------------------------------|
+| Запустить парсинг             | `app(QueryBuilderService::class)->searchQuery($id)` (tinker / роут)    |
+| Увидеть сколько в очереди     | Horizon UI → Current Workload, либо `redis-cli LLEN queues:search`     |
+| Понять почему джоба не идёт   | Horizon UI → Failed Jobs                                               |
+| Применил миграцию / правил код| `docker compose -f dev-compose.yml restart queue`                      |
+| Сбросить всё                  | `redis-cli FLUSHALL` + рестарт `queue`                                 |

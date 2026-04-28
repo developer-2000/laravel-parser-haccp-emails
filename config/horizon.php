@@ -202,7 +202,7 @@ return [
             'queue' => ['search'],
             'balance' => 'simple',
             'minProcesses' => 1,
-            'maxProcesses' => 2,
+            'maxProcesses' => 3,
             'memory' => 256,
             'tries' => 3,
             'timeout' => 300,
@@ -251,7 +251,7 @@ return [
 
     'environments' => [
         'production' => [
-            'search'   => ['maxProcesses' => 4],
+            'search'   => ['maxProcesses' => 5],
             'crawl'    => ['maxProcesses' => 10],
             'classify' => ['maxProcesses' => 4],
             'enrich'   => ['maxProcesses' => 4],
@@ -259,7 +259,7 @@ return [
         ],
 
         'local' => [
-            'search'   => ['maxProcesses' => 2],
+            'search'   => ['maxProcesses' => 3],
             'crawl'    => ['maxProcesses' => 3],
             'classify' => ['maxProcesses' => 2],
             'enrich'   => ['maxProcesses' => 2],

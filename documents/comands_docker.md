@@ -64,7 +64,7 @@ docker compose -f dev-compose.yml exec app cp .env.example .env
 DB_CONNECTION=mysql
 DB_HOST=db
 DB_PORT=3306
-DB_DATABASE=laravel
+DB_DATABASE=parser_haccp
 DB_USERNAME=root
 DB_PASSWORD=root
 ```
@@ -81,6 +81,30 @@ docker compose -f dev-compose.yml exec app php artisan key:generate
 
 ```bash
 docker compose -f dev-compose.yml exec app php artisan migrate
+```
+
+- Запуск сидеров (заполнение справочников по конфигу `DatabaseSeeder`)
+
+```bash
+docker compose -f dev-compose.yml exec app php artisan db:seed
+```
+
+- Запуск конкретного сидера
+
+```bash
+docker compose -f dev-compose.yml exec app php artisan db:seed --class=LanguageSeeder
+```
+
+- Полная пересборка БД с нуля + сиды (дропает все таблицы, прогоняет миграции, запускает сидеры)
+
+```bash
+docker compose -f dev-compose.yml exec app php artisan migrate:fresh --seed
+```
+
+- Откат всех миграций и повторный накат + сиды (без полного дропа БД)
+
+```bash
+docker compose -f dev-compose.yml exec app php artisan migrate:refresh --seed
 ```
 
 - Пересборка после изменения конфигов

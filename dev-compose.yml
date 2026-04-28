@@ -6,6 +6,7 @@ services:
     restart: unless-stopped
     ports:
       - "8080:80"
+      - "5173:5173"
     volumes:
       - .:/var/www/html
       - app_vendor:/var/www/html/vendor
@@ -44,7 +45,7 @@ services:
       resources:
         limits:
           cpus: "2.0"
-          memory: 1G
+          memory: 512M
 
   scheduler:
     build: .
@@ -70,7 +71,7 @@ services:
       --innodb_log_buffer_size=64M
       --max_connections=200
     environment:
-      MYSQL_DATABASE: laravel
+      MYSQL_DATABASE: parser_haccp
       MYSQL_ROOT_PASSWORD: root
     volumes:
       - db_data:/var/lib/mysql

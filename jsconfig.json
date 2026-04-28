@@ -1,0 +1,26 @@
+{
+    "compilerOptions": {
+        "baseUrl": ".",
+        "paths": {
+            "@/*": ["resources/js/*"],
+            "@scss/*": ["resources/scss/*"]
+        },
+        "module": "ESNext",
+        "moduleResolution": "Bundler",
+        "target": "ESNext",
+        "jsx": "preserve",
+        "allowJs": true,
+        "checkJs": false
+    },
+    "include": [
+        "resources/js/**/*",
+        "resources/js/**/*.vue",
+        "resources/scss/**/*",
+        "vite.config.js"
+    ],
+    "exclude": [
+        "node_modules",
+        "public/build",
+        "vendor"
+    ]
+}
