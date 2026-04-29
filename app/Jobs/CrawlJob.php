@@ -17,6 +17,43 @@ class CrawlJob implements ShouldQueue
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     /**
+     * Slug'и контактных/юридических/о-компании страниц, по которым шлём
+     * дополнительные fetch'и в поиске email и телефонов.
+     *
+     * Список мультиязычный (топ-7 языков EU + общие). Для редких языков
+     * работает extractMenuContactLinks(), который читает ссылки прямо
+     * с главной по их фактическому названию.
+     */
+    private const CONTACT_PATHS = [
+        // contact / kontakt / contatti / contacto / contato
+        'contact', 'contact-us', 'contacts',
+        'kontakt', 'kontakti', 'kontaktai',
+        'contacto', 'contatti', 'contato',
+        'kapcsolat', 'yhteystiedot',
+
+        // О компании
+        'about', 'about-us',
+        'ueber-uns', 'uber-uns',
+        'chi-siamo', 'sobre-nos', 'sobre-nosotros',
+        'qui-sommes-nous', 'a-propos',
+        'o-nas', 'o-nama', 'over-ons', 'om-oss',
+
+        // Команда / компания / impressum
+        'team', 'equipe', 'equipo', 'squadra',
+        'company', 'unternehmen', 'firma', 'empresa', 'azienda',
+        'impressum', 'imprint',
+
+        // Юр. / приватность
+        'legal', 'privacy', 'privacy-policy',
+        'datenschutz', 'agb',
+        'mentions-legales', 'aviso-legal', 'privacidade',
+
+        // Поддержка / продажи
+        'support', 'help', 'customer-service',
+        'sales', 'vertrieb', 'office',
+    ];
+
+    /**
      * URL компании, которую мы будем скрапить
      * (это домен из SearchJob)
      */
@@ -40,7 +77,7 @@ class CrawlJob implements ShouldQueue
      * ОСНОВНОЙ PIPELINE:
      * 1. скачать HTML главной страницы
      * 2. извлечь базовые данные (email, phone, title)
-     * 3. дополнительно проверить /impressum и /contact
+     * 3. пройти по мультиязычному списку контактных страниц (CONTACT_PATHS)
      * 4. объединить данные
      * 5. очистить и дедуплицировать
      * 6. сохранить в БД как компанию
@@ -111,30 +148,18 @@ class CrawlJob implements ShouldQueue
 
         /**
          * STEP 3:
-         * попытка найти более точные данные на:
-         * - /impressum (Германия обязателен)
-         * - /contact (контакты)
+         * проходим по мультиязычному списку контактных страниц
+         * (CONTACT_PATHS) и собираем email/phone со всех существующих.
+         * Для редких языков работает STEP 5.5 (extractMenuContactLinks).
          */
-        $impressumHtml = $this->fetch($this->resolvePage($this->url, 'impressum'));
-        $contactHtml   = $this->fetch($this->resolvePage($this->url, 'contact'));
-
-        /**
-         * STEP 4:
-         * если impressum существует → добавляем данные
-         * (там обычно самый чистый email в ЕС)
-         */
-        if ($impressumHtml) {
-            $emails = array_merge($emails, $this->extractEmails($impressumHtml));
-            $phones = array_merge($phones, $this->extractPhones($impressumHtml));
-        }
-
-        /**
-         * STEP 5:
-         * если contact существует → тоже добавляем данные
-         */
-        if ($contactHtml) {
-            $emails = array_merge($emails, $this->extractEmails($contactHtml));
-            $phones = array_merge($phones, $this->extractPhones($contactHtml));
+        $base = rtrim($this->url, '/');
+        foreach (self::CONTACT_PATHS as $path) {
+            $pageHtml = $this->fetch($base . '/' . $path . '/');
+            if (!$pageHtml) {
+                continue;
+            }
+            $emails = array_merge($emails, $this->extractEmails($pageHtml));
+            $phones = array_merge($phones, $this->extractPhones($pageHtml));
         }
 
         /**
@@ -282,12 +307,19 @@ class CrawlJob implements ShouldQueue
 
     /**
      * STEP B:
-     * извлечение email — 3 прохода:
+     * извлечение email — 6 проходов:
      *   1. Прямой regex по сырому HTML (для незашитых email).
      *   2. После нормализации обфускаций (∂ / [at] / (at) / &#64; / &commat; → @,
      *      удаление <span>...</span> и других тегов между частями адреса).
      *   3. Парсинг data-email='{"name":"X","host":"Y"}' атрибутов (CMS типа JTL,
      *      Shopware, Joomla кладут туда контакт-email и склеивают через JS).
+     *   4. Cloudflare email protection (data-cfemail / cdn-cgi/l/email-protection)
+     *      — XOR-зашифрованные email на сайтах за CF.
+     *   5. Mailto-ссылки с URL-encoded или HTML-entity содержимым
+     *      (mailto:%69%6e%66%6f@site.de или mailto:info&#64;site.de) —
+     *      обычный regex такие пропускает.
+     *   6. JS-конкатенация ("info" + "@" + "company.de") — частая обфускация
+     *      от ботов, обычный regex её не видит.
      *
      * Ограничения базового regex:
      *   - TLD длиной 2..6 — чтобы не захватить "deUmsatzsteuer..." после .de.
@@ -308,8 +340,13 @@ class CrawlJob implements ShouldQueue
             '@',
             $normalized
         );
-        // Удаляем все теги, чтобы info<span>@</span>verdie-gmbh.de схлопнулось в info@verdie-gmbh.de
-        $normalized = strip_tags($normalized);
+        // Заменяем теги ПРОБЕЛОМ (а не пустой строкой). strip_tags склеивает соседние
+        // ячейки таблиц/абзацев без разделителя — это даёт мусор вида
+        // "telefonverkaufs.ernst@..." (имя из ячейки + username из мейлто рядом).
+        $normalized = preg_replace('/<[^>]+>/', ' ', $normalized);
+        // Схлопываем пробелы вокруг @ — кейс "support [at] example.com" после
+        // подмены [at]→@ оставляет "support @ example.com", который regex не видит.
+        $normalized = preg_replace('/([\w._%+-])\s*@\s*([\w.-])/u', '$1@$2', $normalized);
         preg_match_all($regex, $normalized, $obfuscated);
 
         // Проход 3: data-email JSON-атрибуты вида {"name":"info","host":"verdie-gmbh.de"}.
@@ -329,7 +366,156 @@ class CrawlJob implements ShouldQueue
             }
         }
 
-        return array_merge($direct[0] ?? [], $obfuscated[0] ?? [], $jsonEmails);
+        // Проход 4: Cloudflare email protection.
+        $cfEmails = $this->decodeCfEmails($html);
+
+        // Проход 5: mailto-ссылки с URL-encoded / HTML-entity содержимым.
+        $mailtoEmails = $this->extractMailtoEmails($html);
+
+        // Проход 6: JS-конкатенация ("info" + "@" + "company.de").
+        $jsConcatEmails = $this->extractJsConcatEmails($html);
+
+        return $this->cleanEmailCandidates(array_merge(
+            $direct[0] ?? [],
+            $obfuscated[0] ?? [],
+            $jsonEmails,
+            $cfEmails,
+            $mailtoEmails,
+            $jsConcatEmails
+        ));
+    }
+
+    /**
+     * Финальная очистка кандидатов внутри extractEmails:
+     *   - нормализация (strtolower + trim) — чтобы INFO@SITE.DE и info@site.de
+     *     схлопывались на этапе array_unique;
+     *   - отсев псевдо-email из имён файлов (logo@2x.png, font@2x.woff2),
+     *     раньше эта проверка стояла в filterEmails;
+     *   - отсев пустых строк.
+     *
+     * Шаблонные имена и tracking-домены здесь НЕ отсекаем — это финальная
+     * сетка filterEmails в handle().
+     */
+    private function cleanEmailCandidates(array $emails): array
+    {
+        $assetExt = '/\.(png|jpe?g|gif|webp|svg|ico|bmp|css|js|woff2?|ttf|eot)$/i';
+
+        $clean = [];
+        foreach ($emails as $email) {
+            $email = strtolower(trim($email));
+            if ($email === '' || preg_match($assetExt, $email)) {
+                continue;
+            }
+            $clean[] = $email;
+        }
+
+        return $clean;
+    }
+
+    /**
+     * Извлекает email, склеенный в JS из строковых литералов:
+     *   var email = "info" + "@" + "company.de";
+     *   var email = 'info' + '@' + 'company.de';
+     *
+     * Кавычки могут быть смешанными между сегментами. Регекс намеренно простой
+     * (3 части), более экзотические варианты (split на 2 куска) не покрываем —
+     * ROI пограничный.
+     *
+     * Используется в extractEmails() как 6-й проход.
+     */
+    private function extractJsConcatEmails(string $html): array
+    {
+        $regex = '/["\']([a-zA-Z0-9._%+-]+)["\']\s*\+\s*["\']@["\']\s*\+\s*["\']([a-zA-Z0-9.-]+\.[a-zA-Z]{2,6})["\']/';
+
+        if (!preg_match_all($regex, $html, $matches, PREG_SET_ORDER)) {
+            return [];
+        }
+
+        $emails = [];
+        foreach ($matches as $m) {
+            $emails[] = $m[1] . '@' . $m[2];
+        }
+
+        return $emails;
+    }
+
+    /**
+     * Извлекает email из mailto-ссылок с раскрытием URL-encoded и HTML-entity.
+     *
+     * Ловит случаи, которые обычный regex по тексту HTML пропускает:
+     *   - mailto:%69%6e%66%6f@site.de  (URL-encoded имя)
+     *   - mailto:info&#64;site.de      (HTML-entity вместо @)
+     *
+     * Используется в extractEmails() как 5-й проход.
+     */
+    private function extractMailtoEmails(string $html): array
+    {
+        if (!preg_match_all('/mailto:([^"\'>?\s]+)/i', $html, $matches)) {
+            return [];
+        }
+
+        $emails = [];
+        foreach ($matches[1] as $raw) {
+            $email = urldecode(html_entity_decode($raw));
+            if (preg_match('/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,6}$/', $email)) {
+                $emails[] = $email;
+            }
+        }
+
+        return $emails;
+    }
+
+    /**
+     * Извлекает все Cloudflare-зашифрованные email из HTML.
+     *
+     * CF прячет email двумя способами:
+     *   - <span class="__cf_email__" data-cfemail="6e07000801...">[email protected]</span>
+     *   - <a href="/cdn-cgi/l/email-protection#6e07000801...">contact</a>
+     *
+     * Используется в extractEmails() как 4-й проход.
+     */
+    private function decodeCfEmails(string $html): array
+    {
+        if (!preg_match_all(
+            '/(?:data-cfemail=["\']|cdn-cgi\/l\/email-protection#)([a-f0-9]+)/i',
+            $html,
+            $matches
+        )) {
+            return [];
+        }
+
+        $emails = [];
+        foreach ($matches[1] as $encoded) {
+            $decoded = $this->decodeCfEmail($encoded);
+            if ($decoded !== null) {
+                $emails[] = $decoded;
+            }
+        }
+
+        return $emails;
+    }
+
+    /**
+     * Декодирует один CF-email: первый байт строки — XOR-ключ,
+     * остальные байты — символы email, зашифрованные XOR'ом с этим ключом.
+     *
+     * Возвращает null, если строка некорректна или результат не похож на email.
+     */
+    private function decodeCfEmail(string $encoded): ?string
+    {
+        $len = strlen($encoded);
+        if ($len < 4 || $len % 2 !== 0) {
+            return null;
+        }
+
+        $key = hexdec(substr($encoded, 0, 2));
+        $email = '';
+
+        for ($n = 2; $n < $len; $n += 2) {
+            $email .= chr(hexdec(substr($encoded, $n, 2)) ^ $key);
+        }
+
+        return preg_match('/^[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}$/', $email) ? $email : null;
     }
 
     /**
@@ -402,37 +588,16 @@ class CrawlJob implements ShouldQueue
     }
 
     /**
-     * STEP E:
-     * генерация URL дополнительных страниц.
-     *
-     * Логика:
-     *   - impressum → юридическая информация (ЕС)
-     *   - contact → контакты
-     *
-     * Trailing slash обязателен — многие CMS (особенно WordPress со строгими
-     * permalink'ами, как schroeder-fleischwaren.de) на /kontakt без слеша
-     * отдают 403/404, а на /kontakt/ — 200 с реальным контентом.
-     */
-    private function resolvePage(string $url, string $type): string
-    {
-        $base = rtrim($url, '/');
-
-        return match ($type) {
-            'impressum' => $base . '/impressum/',
-            'contact' => $base . '/kontakt/',
-            default => $base
-        };
-    }
-
-    /**
      * STEP F:
-     * фильтрация мусорных email.
+     * фильтрация мусорных email (финальная сетка).
      *
      * Убираем:
      *   - шаблонные placeholder'ы (test/example/dummy/mustermann/mymail/youremail)
-     *   - "псевдо-email" из image-файлов с ретина-маркером (logo@2x.png, flags@2x.webp)
      *   - tracking/телеметрия (Sentry, Google Tag Manager, Wix-pixel)
      *   - long-hex usernames (>=20 hex-символов до @ — это ID, не email)
+     *
+     * Asset-файлы (logo@2x.png и т.п.) отсекаются раньше — внутри
+     * extractEmails через cleanEmailCandidates.
      */
     private function filterEmails(array $emails): array
     {
@@ -465,11 +630,6 @@ class CrawlJob implements ShouldQueue
                     return false;
                 }
 
-                // 2. Image-файлы с ретина-маркером: name@2x.png, logo@2.jpg, flags@2x.webp
-                if (preg_match('/\.(png|jpe?g|gif|webp|svg|ico|bmp|css|js|woff2?|ttf|eot)$/i', $email)) {
-                    return false;
-                }
-
                 // 3. Длинный hex-username (Sentry-DSN, GA-ID, и подобные tracking-эндпоинты).
                 //    Пример: 605a7baede844d278b89dc95ae0a9123@sentry-next.wixpress
                 if (preg_match('/^[a-f0-9]{20,}@/i', $email)) {
@@ -481,9 +641,94 @@ class CrawlJob implements ShouldQueue
                     return false;
                 }
 
+                // 5. Sanity-проверка качества (ловит склейки типа telefonverkaufs.ernst@…,
+                //    9966-250zentrale@…det, freitagj.freitag@…).
+                if (!$this->validateEmailQuality($email)) {
+                    return false;
+                }
+
                 return true;
             })
         );
+    }
+
+    /**
+     * Sanity-проверка качества email — ловит склейки и битые адреса,
+     * прорвавшиеся сквозь все 6 проходов извлечения.
+     *
+     * Правила:
+     *   1. Домен содержит точку.
+     *   2. TLD из whitelist EU (de/at/ch + EN/.com/EU + 25 национальных).
+     *      Отсекает мусор вроде ".det", ".cim", ".dee" — артефакты склеек
+     *      domain-text после strip_tags.
+     *   3. Username не длиннее 32 символов.
+     *   4. Username не начинается с 2+ цифр (телефон, склеившийся с email).
+     *   5. Username не содержит текстовый мусор (telefon/fax/durchwahl/…).
+     *   6. Username без двойного повторения слова длиннее 3 символов
+     *      (схватывает склейки вроде demuths.demuth, freitagj.freitag).
+     *   7. Username содержит максимум 2 точки.
+     */
+    private function validateEmailQuality(string $email): bool
+    {
+        $parts = explode('@', strtolower($email), 2);
+        if (count($parts) !== 2) {
+            return false;
+        }
+        [$user, $domain] = $parts;
+
+        if (!str_contains($domain, '.')) {
+            return false;
+        }
+
+        $tldWhitelist = '/\.(?:'
+            // global
+            . 'com|net|org|eu|info|io|biz'
+            // DACH
+            . '|de|at|ch|li'
+            // FR / BE / LU
+            . '|fr|be|lu|mc'
+            // IT / IB
+            . '|it|sm'
+            // ES / PT
+            . '|es|pt|ad'
+            // NL
+            . '|nl'
+            // CEE
+            . '|pl|cz|sk|hu|ro|bg|hr|si'
+            // Nordics
+            . '|dk|se|no|fi|is'
+            // British Isles + IE
+            . '|ie|uk|gb|im|je'
+            // South-EU
+            . '|gr|cy|mt|tr'
+            // Baltics
+            . '|lt|lv|ee'
+            . ')$/';
+        if (!preg_match($tldWhitelist, $domain)) {
+            return false;
+        }
+
+        if (strlen($user) > 32) {
+            return false;
+        }
+
+        if (preg_match('/^\d{2,}/', $user)) {
+            return false;
+        }
+
+        if (preg_match('/telefon|fax|durchwahl|verkauf|innendienst|tssicherung/', $user)) {
+            return false;
+        }
+
+        if (preg_match('/([a-z]{3,}).*\1/', $user)) {
+            return false;
+        }
+
+        if (substr_count($user, '.') > 2) {
+            return false;
+        }
+
+        return true;
     }
 
     /**
@@ -554,7 +799,34 @@ class CrawlJob implements ShouldQueue
      */
     private function extractMenuContactLinks(string $html, string $baseUrl): array
     {
-        $keywords = ['kontakt', 'contact', 'impressum', 'anfahrt', 'standort'];
+        $keywords = [
+            // контакт
+            'kontakt', 'contact', 'contacts',
+            'contatti', 'contacto', 'contato',
+            'kapcsolat', 'yhteystiedot',
+
+            // импрессум / о компании
+            'impressum', 'imprint',
+            'about', 'about us',
+            'über uns', 'ueber uns', 'uber uns',
+            'chi siamo', 'sobre nos', 'sobre nosotros',
+            'qui sommes nous', 'a propos', 'à propos',
+            'o nas', 'over ons', 'om oss',
+            'unternehmen', 'company', 'firma',
+            'azienda', 'empresa',
+
+            // команда
+            'team', 'equipe', 'équipe',
+            'equipo', 'squadra',
+
+            // поддержка / продажи / офис
+            'support', 'service', 'kundenservice',
+            'customer service', 'customer care', 'customer-service',
+            'sales', 'vertrieb', 'office', 'help',
+
+            // адрес / расположение
+            'anfahrt', 'standort',
+        ];
 
         if (!preg_match_all(
             '/<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)<\/a>/is',

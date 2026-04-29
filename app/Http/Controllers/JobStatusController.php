@@ -22,12 +22,16 @@ class JobStatusController extends BaseController
     public function index(): JsonResponse
     {
         $running = false;
+        $sizes = [];
         foreach (self::QUEUES as $queue) {
-            if (Queue::size($queue) > 0) {
+            $size = Queue::size($queue);
+            $sizes[$queue] = $size;
+            if ($size > 0) {
                 $running = true;
-                break;
             }
         }
+
+        \Log::info('[JobStatus] sizes=' . json_encode($sizes) . ' running=' . ($running ? '1' : '0') . ' driver=' . config('queue.default'));
 
         return $this->getSuccessResponse('', ['running' => $running]);
     }
