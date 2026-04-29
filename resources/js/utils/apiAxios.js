@@ -1,4 +1,5 @@
 import axios from "axios";
+import { notification } from "./notify.js";
 
 /**
  * Разбор Laravel / типичного JSON с полем errors → одна строка (разделитель — перенос строки;
@@ -243,10 +244,19 @@ export class ApiAxios {
 }
 
 /**
- * Инстанс по умолчанию (тот же origin, без тостов и редиректов). Для публичных GET вроде `/survey/questions`.
+ * Инстанс по умолчанию (тот же origin). Использует naive-ui notification
+ * через discrete API — работает вне setup-контекста.
  */
 const defaultApiAxios = new ApiAxios({
     baseURL: "",
+    showToast: (title, content) => {
+        notification.error({
+            title: String(title),
+            content: String(content),
+            duration: 5000,
+            keepAliveOnHover: true,
+        });
+    },
 });
 
 export default defaultApiAxios;

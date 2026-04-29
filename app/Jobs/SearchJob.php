@@ -4,6 +4,7 @@ namespace App\Jobs;
 
 use App\Models\Company;
 use App\Services\AppLogger;
+use App\Services\LeadClassifier;
 use App\Services\PlaywrightService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -15,8 +16,20 @@ class SearchJob implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    public int $querySetId;
-    public string $query;
+    public int $searchQueryId;
+    public string $textQuery;
+
+    /**
+     * Код языка ("de" / "en" / …) — нужен для регионализации поиска DuckDuckGo
+     * (kl-параметр) и для записи языка к найденным компаниям.
+     */
+    public ?string $languageCode;
+
+    /**
+     * id типа бизнеса (type_business.id). По нему LeadClassifier выбирает
+     * набор правил из config/site/meat_scoring.php.
+     */
+    public ?int $typeBusinessId;
 
     /**
      * iteration = логическая "страница" — шаг обхода выдачи.
@@ -35,14 +48,18 @@ class SearchJob implements ShouldQueue
     public ?array $nextPageParams;
 
     public function __construct(
-        int $querySetId,
-        string $query,
+        int $searchQueryId,
+        string $textQuery,
+        ?string $languageCode = null,
+        ?int $typeBusinessId = null,
         int $iteration = 0,
         int $retry = 0,
         ?array $nextPageParams = null
     ) {
-        $this->querySetId = $querySetId;
-        $this->query = $query;
+        $this->searchQueryId = $searchQueryId;
+        $this->textQuery = $textQuery;
+        $this->languageCode = $languageCode;
+        $this->typeBusinessId = $typeBusinessId;
         $this->iteration = $iteration;
         $this->maxIterations = 3;
         $this->retry = $retry;
@@ -51,13 +68,14 @@ class SearchJob implements ShouldQueue
 
     public function handle(
         AppLogger $logger,
-        PlaywrightService $playwright
+        PlaywrightService $playwright,
+        LeadClassifier $classifier
     ): void {
 
-        $logger->write("ITERATION = {$this->iteration} retry={$this->retry}", 'search.log');
+        $logger->write("ИТЕРАЦИЯ = {$this->iteration} попытка={$this->retry}", 'search.log');
 
         if ($this->iteration >= $this->maxIterations) {
-            $logger->write("[STOP] maxIterations reached", 'search.log');
+            $logger->write("[СТОП] достигнут лимит итераций", 'search.log');
             return;
         }
 
@@ -68,7 +86,7 @@ class SearchJob implements ShouldQueue
             $html = $this->fetchSerpHtml($playwright, $logger);
 
             $bytes = strlen($html);
-            $logger->write("[2] bytes={$bytes}", 'search.log');
+            $logger->write("[2] байт={$bytes}", 'search.log');
 
             // ERROR - Проверка валидности ответа DuckDuckGo:
             // bytes < 5000 → ответ слишком короткий, чтобы быть нормальной
@@ -84,25 +102,38 @@ class SearchJob implements ShouldQueue
 
             // STOP
             if (count($newLinks) === 0) {
-                $logger->write("[STOP] no new links after dedup", 'search.log');
+                $logger->write("[СТОП] нет новых ссылок после дедупликации", 'search.log');
                 return;
             }
 
-            $dispatched = 0;
-            // 3 Ставим новую задачу в очередь - откроет сайт, извлечёт данные и сохранит контакты в DB
-            foreach ($newLinks as $link) {
-                CrawlJob::dispatch($link)->onQueue('crawl');
+            // 3 Ранний URL-фильтр через LeadClassifier — отсекаем заведомый
+            //   мусор по сигналам в URL (shop, maschinen, verband и т.п.),
+            //   не тратя CrawlJob на гарантированно нерелевантные сайты.
+            $qualified = $this->filterByClassifier($newLinks, $classifier, $logger);
 
-                $dispatched++;
+            // Если на текущей странице SERP ни одного qualified —
+            // НЕ останавливаем обход выдачи. Просто пропускаем dispatch
+            // и идём дальше: на следующих страницах могут быть хорошие URL.
+            $dispatched = 0;
+            if (empty($qualified)) {
+                $logger->write("[пропуск-диспатча] на этой странице ни одного подходящего URL", 'search.log');
+            } else {
+                // 4 Ставим новую задачу в очередь - откроет сайт, извлечёт данные и сохранит контакты в DB
+                foreach ($qualified as $link) {
+                    CrawlJob::dispatch($link, $this->searchQueryId, $this->typeBusinessId)
+                        ->onQueue('crawl');
+
+                    $dispatched++;
+                }
             }
 
-            $logger->write("[3] dispatched={$dispatched}", 'search.log');
+            $logger->write("[3] отправлено в очередь={$dispatched}", 'search.log');
 
-            // 4 Планируем следующую итерацию (если в выдаче есть следующая страница)
+            // 5 Планируем следующую итерацию (если в выдаче есть следующая страница)
             $this->scheduleNextIteration($html, $logger);
 
         } catch (\Throwable $e) {
-            $logger->write("[ERROR] {$e->getMessage()} retry={$this->retry}", 'search.log');
+            $logger->write("[ОШИБКА] {$e->getMessage()} попытка={$this->retry}", 'search.log');
 
             /**
              * Retry-механизм при сбое итерации.
@@ -115,7 +146,7 @@ class SearchJob implements ShouldQueue
              * Что делаем:
              *   - До 3 повторов на одну и ту же итерацию (retry=0 → 1 → 2 → 3).
              *   - Переписпатчим тот же SearchJob с теми же параметрами
-             *     (querySetId, query, iteration, nextPageParams), но с retry+1.
+             *     (searchQueryId, textQuery, iteration, nextPageParams), но с retry+1.
              *   - Задержка 3–8 секунд — чтобы не долбить DDG сразу после блока.
              *   - return — выходим из handle, новая попытка пойдёт уже как
              *     отдельный job из очереди.
@@ -125,8 +156,10 @@ class SearchJob implements ShouldQueue
              */
             if ($this->retry < 3) {
                 self::dispatch(
-                    $this->querySetId,
-                    $this->query,
+                    $this->searchQueryId,
+                    $this->textQuery,
+                    $this->languageCode,
+                    $this->typeBusinessId,
                     $this->iteration,
                     $this->retry + 1,
                     $this->nextPageParams
@@ -137,7 +170,7 @@ class SearchJob implements ShouldQueue
                 return;
             }
 
-            $logger->write("[FAIL] iteration={$this->iteration} retries exhausted", 'search.log');
+            $logger->write("[ПРОВАЛ] итерация={$this->iteration} попытки исчерпаны", 'search.log');
         }
     }
 
@@ -166,12 +199,12 @@ class SearchJob implements ShouldQueue
         try {
             if ($mode === 'search') {
                 // первая страница выдачи — обычный поиск по строке запроса
-                return $playwright->search($this->query);
+                return $playwright->search($this->textQuery, $this->languageCode);
             }
 
             // следующая страница — переиспользуем форму Next предыдущей итерации
             $sParam = $this->nextPageParams['s'] ?? '?';
-            return $playwright->nextPage($this->nextPageParams);
+            return $playwright->nextPage($this->nextPageParams, $this->languageCode);
         }
         catch (\Throwable $e) {
             $this->logPlaywrightError($logger, $mode, $e);
@@ -186,7 +219,7 @@ class SearchJob implements ShouldQueue
      * Что попадает в запись:
      *   - время (добавляет AppLogger автоматически)
      *   - что делали (mode = search | nextPage)
-     *   - у кого (querySetId, query, iteration, retry)
+     *   - у кого (searchQueryId, textQuery, iteration, retry)
      *   - что произошло (класс исключения, сообщение, файл и строка, stack trace)
      *   - параметры пагинации, если упал nextPage (для воспроизведения)
      */
@@ -195,8 +228,8 @@ class SearchJob implements ShouldQueue
         $payload = [
             'event'         => 'playwright_failure',
             'mode'          => $mode,
-            'querySetId'    => $this->querySetId,
-            'query'         => $this->query,
+            'searchQueryId'    => $this->searchQueryId,
+            'textQuery'     => $this->textQuery,
             'iteration'     => $this->iteration,
             'retry'         => $this->retry,
             'nextPageParams' => $this->nextPageParams,
@@ -227,18 +260,20 @@ class SearchJob implements ShouldQueue
         $nextPageParams = $this->extractNextPageParams($html);
 
         if ($nextPageParams === null) {
-            $logger->write("[next-page] not found — последняя страница выдачи, STOP", 'search.log');
+            $logger->write("[следующая-страница] не найдена — последняя страница выдачи, СТОП", 'search.log');
             return;
         }
 
         $logger->write(
-            "[next-page] found s={$nextPageParams['s']} keys=" . implode(',', array_keys($nextPageParams)),
+            "[следующая-страница] найдена s={$nextPageParams['s']} ключи=" . implode(',', array_keys($nextPageParams)),
             'search.log'
         );
 
         self::dispatch(
-            $this->querySetId,
-            $this->query,
+            $this->searchQueryId,
+            $this->textQuery,
+            $this->languageCode,
+            $this->typeBusinessId,
             $this->iteration + 1,
             0,
             $nextPageParams
@@ -260,7 +295,7 @@ class SearchJob implements ShouldQueue
     {
         // 0. достаём сырые ссылки из HTML выдачи DuckDuckGo
         $rawLinks = $this->extractLinksSERP($html);
-        $logger->write('[raw] count=' . count($rawLinks), 'search.log');
+        $logger->write('[сырые] количество=' . count($rawLinks), 'search.log');
 
         // выдача пустая — дальше делать нечего
         if (empty($rawLinks)) {
@@ -293,7 +328,7 @@ class SearchJob implements ShouldQueue
             $rawLinks
         )));
 
-        $logger->write('[normalized] count=' . count($normalized), 'search.log');
+        $logger->write('[нормализовано] количество=' . count($normalized), 'search.log');
 
         return $normalized;
     }
@@ -308,7 +343,7 @@ class SearchJob implements ShouldQueue
         $unique = array_values(array_unique($normalized));
         $merged = count($normalized) - count($unique);
 
-        $logger->write('[unique-in-batch] count=' . count($unique) . " merged={$merged}", 'search.log');
+        $logger->write('[уникальные-в-пачке] количество=' . count($unique) . " схлопнуто={$merged}", 'search.log');
 
         return $unique;
     }
@@ -378,6 +413,49 @@ class SearchJob implements ShouldQueue
         $logger->write('[new-unique] count=' . count($newLinks), 'search.log');
 
         return $newLinks;
+    }
+
+    /**
+     * Ранний URL-фильтр через LeadClassifier.
+     *
+     * Считает tier для каждой ссылки в URL-only режиме (без HTML).
+     * Tier=0 → отбрасываем (заведомый мусор: shop, maschinen, verband и т.п.).
+     * Tier>=1 → передаём дальше в CrawlJob, где будет финальная классификация
+     * с учётом текста главной страницы.
+     *
+     * В лог пишем сводку по tier'ам и список отброшенных, чтобы было видно,
+     * какие домены отсекаются на этом этапе.
+     */
+    private function filterByClassifier(array $links, LeadClassifier $classifier, AppLogger $logger): array
+    {
+        $qualified = [];
+        $dropped = [];
+        $tierStats = [0 => 0, 1 => 0, 2 => 0, 3 => 0];
+
+        foreach ($links as $link) {
+            $tier = $classifier->classify($link, null, $this->typeBusinessId);
+            $tierStats[$tier]++;
+
+            if ($tier === 0) {
+                $dropped[] = $link;
+                continue;
+            }
+            $qualified[] = $link;
+        }
+
+        if ($dropped) {
+            $logger->write(
+                '[classifier-dropped] count=' . count($dropped) . ' list=' . json_encode($dropped, JSON_UNESCAPED_SLASHES),
+                'search.log'
+            );
+        }
+        $logger->write(
+            '[classifier-stats] t0=' . $tierStats[0] . ' t1=' . $tierStats[1] . ' t2=' . $tierStats[2] . ' t3=' . $tierStats[3],
+            'search.log'
+        );
+        $logger->write('[qualified] count=' . count($qualified), 'search.log');
+
+        return $qualified;
     }
 
     /**

@@ -8,15 +8,16 @@ return new class extends Migration
 {
     public function up(): void
     {
-        Schema::create('queries', function (Blueprint $table) {
+        Schema::create('type_business', function (Blueprint $table) {
             $table->id();
-            $table->foreignId('language_id')->constrained('languages')->cascadeOnDelete();
-            $table->string('keyword');
+            $table->string('name')
+                ->collation('utf8mb4_unicode_ci')->unique();
+            $table->timestamps();
         });
     }
 
     public function down(): void
     {
-        Schema::dropIfExists('queries');
+        Schema::dropIfExists('type_business');
     }
 };

@@ -6,40 +6,47 @@ use Illuminate\Support\Facades\Http;
 
 class DuckHttpClient
 {
-    public function get(string $url): string
+    /**
+     * Дефолтный Accept-Language, если не передан явно.
+     * Используется только как страховка; обычно вызывающий передаёт значение
+     * из config/site/language.php (через PlaywrightService).
+     */
+    private const DEFAULT_ACCEPT_LANGUAGE = 'en-US,en;q=0.9';
+
+    public function get(string $url, ?string $acceptLanguage = null): string
     {
         return Http::timeout(20)
-            ->withHeaders($this->headers())
+            ->withHeaders($this->headers($acceptLanguage))
             ->get($url)
             ->body();
     }
 
-    public function post(string $url, array $data): string
+    public function post(string $url, array $data, ?string $acceptLanguage = null): string
     {
         return Http::timeout(20)
             ->asForm()
-            ->withHeaders($this->postHeaders())
+            ->withHeaders($this->postHeaders($acceptLanguage))
             ->post($url, $data)
             ->body();
     }
 
-    private function headers(): array
+    private function headers(?string $acceptLanguage): array
     {
         return [
-            'User-Agent' => $this->ua(),
-            'Accept' => 'text/html',
-            'Accept-Language' => 'de-DE,de;q=0.9',
+            'User-Agent'      => $this->ua(),
+            'Accept'          => 'text/html',
+            'Accept-Language' => $acceptLanguage ?? self::DEFAULT_ACCEPT_LANGUAGE,
         ];
     }
 
-    private function postHeaders(): array
+    private function postHeaders(?string $acceptLanguage): array
     {
         return [
-            'User-Agent' => $this->ua(),
-            'Content-Type' => 'application/x-www-form-urlencoded',
-            'Origin' => 'https://duckduckgo.com',
-            'Referer' => 'https://duckduckgo.com/',
-            'Accept-Language' => 'de-DE,de;q=0.9',
+            'User-Agent'      => $this->ua(),
+            'Content-Type'    => 'application/x-www-form-urlencoded',
+            'Origin'          => 'https://duckduckgo.com',
+            'Referer'         => 'https://duckduckgo.com/',
+            'Accept-Language' => $acceptLanguage ?? self::DEFAULT_ACCEPT_LANGUAGE,
         ];
     }
 

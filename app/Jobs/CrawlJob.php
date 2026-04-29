@@ -4,6 +4,7 @@ namespace App\Jobs;
 
 use App\Models\Company;
 use App\Services\AppLogger;
+use App\Services\LeadClassifier;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -20,10 +21,19 @@ class CrawlJob implements ShouldQueue
      * (это домен из SearchJob)
      */
     public string $url;
+    public int $searchQueryId;
 
-    public function __construct(string $url)
+    /**
+     * id типа бизнеса (type_business.id) — нужен LeadClassifier'у
+     * для выбора набора сигналов из config/site/meat_scoring.php.
+     */
+    public ?int $typeBusinessId;
+
+    public function __construct(string $url, int $searchQueryId, ?int $typeBusinessId = null)
     {
         $this->url = $url;
+        $this->searchQueryId = $searchQueryId;
+        $this->typeBusinessId = $typeBusinessId;
     }
 
     /**
@@ -35,7 +45,7 @@ class CrawlJob implements ShouldQueue
      * 5. очистить и дедуплицировать
      * 6. сохранить в БД как компанию
      */
-    public function handle(AppLogger $logger): void
+    public function handle(AppLogger $logger, LeadClassifier $classifier): void
     {
         // лог начала обработки URL
         $logger->write('CrawlJob START: ' . $this->url, 'crawl.log');
@@ -68,15 +78,22 @@ class CrawlJob implements ShouldQueue
         }
 
         /**
-         * STEP 1.6 — Lead scoring (Tier 3).
-         * Подсчёт сигналов "промышленный мясной производитель" vs "розничный/HoReCa".
-         * Порог низкий (<3), чтобы не зарезать хороших.
+         * STEP 1.6 — Финальная классификация лида через LeadClassifier.
+         *
+         * Считает tier 0..3 на основе сигналов URL и HTML:
+         *   0 — IGNORE  (drop)
+         *   1 — WEAK    (drop, только premium лиды доходят до записи в БД)
+         *   2 — GOOD    (сохраняем)
+         *   3 — IDEAL   (сохраняем)
+         *
+         * Порог tier < 2 — компания не пишется в БД. Это убирает D2C-бренды,
+         * розничных мясников и компании без сильных ICP-сигналов.
          */
-        $score = $this->calculateLeadScore($html);
-        $logger->write("LEAD SCORE: {$score} {$this->url}", 'crawl.log');
+        $tier = $classifier->classify($this->url, $html, $this->typeBusinessId);
+        $logger->write("LEAD TIER: {$tier} {$this->url}", 'crawl.log');
 
-        if ($score < 3) {
-            $logger->write("LOW SCORE DROP: {$this->url}", 'crawl.log');
+        if ($tier < 2) {
+            $logger->write("LOW TIER DROP: tier={$tier} {$this->url}", 'crawl.log');
             return;
         }
 
@@ -176,6 +193,8 @@ class CrawlJob implements ShouldQueue
                 'name' => $companyName,
                 'emails' => json_encode($emails),
                 'phones' => json_encode($phones),
+                'tier' => $tier,
+                'search_query_id' => $this->searchQueryId,
             ]
         );
 
@@ -518,64 +537,6 @@ class CrawlJob implements ShouldQueue
         $regex = '/' . implode('|', array_map('preg_quote', $patterns)) . '/i';
 
         return (bool) preg_match($regex, $title);
-    }
-
-    /**
-     * STEP H — Lead scoring (Tier 3 классификации).
-     *
-     * Считает баллы по сигналам в тексте страницы:
-     *   - +2 за каждое позитивное слово (производство, HACCP, IFS, и т.д.)
-     *   - -3 за каждое негативное слово (restaurant, online shop, lieferservice)
-     *
-     * Возвращает число; в handle() сравнивается с порогом (<3 = drop).
-     * Порог намеренно низкий — лучше пропустить шум, чем зарезать реального производителя.
-     */
-    private function calculateLeadScore(string $html): int
-    {
-        $score = 0;
-        $text = mb_strtolower(strip_tags($html));
-
-        // INDUSTRIAL POSITIVE — признаки промышленного производителя.
-        $positive = [
-            'produktion',
-            'herstellung',
-            'verarbeitung',
-            'werk',
-            'fabrik',
-            'lebensmittelproduktion',
-            'fleischwaren',
-            'haccp',
-            'ifs',
-            'brc',
-            'iso 22000',
-            'qualitätsmanagement',
-            'lebensmittelsicherheit',
-        ];
-        foreach ($positive as $word) {
-            if (str_contains($text, $word)) {
-                $score += 2;
-            }
-        }
-
-        // RETAIL NEGATIVE — розница / HoReCa, не наш target.
-        $negative = [
-            'restaurant',
-            'imbiss',
-            'cafe',
-            'speisekarte',
-            'online shop',
-            'warenkorb',
-            'bestellen',
-            'lieferservice',
-            'takeaway',
-        ];
-        foreach ($negative as $word) {
-            if (str_contains($text, $word)) {
-                $score -= 3;
-            }
-        }
-
-        return $score;
     }
 
     /**

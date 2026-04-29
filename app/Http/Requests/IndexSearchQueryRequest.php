@@ -4,7 +4,7 @@ namespace App\Http\Requests;
 
 use Illuminate\Foundation\Http\FormRequest;
 
-class ShowQueryRequest extends FormRequest
+class IndexSearchQueryRequest extends FormRequest
 {
     public function authorize(): bool
     {
@@ -14,7 +14,8 @@ class ShowQueryRequest extends FormRequest
     public function rules(): array
     {
         return [
-            'search_query_id' => ['required', 'integer', 'exists:search_query,id'],
+            'type_business_id' => ['required', 'integer', 'exists:type_business,id'],
+            'language_code'    => ['required', 'string', 'exists:languages,code'],
         ];
     }
 }
