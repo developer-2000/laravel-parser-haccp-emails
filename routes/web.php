@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\BackupController;
 use App\Http\Controllers\JobStatusController;
 use App\Http\Controllers\LanguageController;
 use App\Http\Controllers\QueryController;
@@ -19,6 +20,8 @@ Route::post('/search-queries', [SearchQueryController::class, 'store']);
 
 Route::get('/jobs/status', [JobStatusController::class, 'index']);
 
+Route::get('/backup/daily', [BackupController::class, 'daily']);
+
 Route::get('/{any?}', function () {
     return view('app');
-})->where('any', '^(?!horizon|languages|language|query|type-businesses|search-queries|jobs).*$');
+})->where('any', '^(?!horizon|languages|language|query|type-businesses|search-queries|jobs|backup).*$');

@@ -252,6 +252,18 @@ async function checkJobStatus() {
     }
 }
 
+// SERVER - тихий ежедневный бэкап БД.
+// На бэке идемпотентно по дате: если файл backup_YYYY-MM-DD.sql уже есть —
+// сервер просто вернёт reason=already_exists, ничего не пересоздавая.
+async function ensureDailyBackup() {
+    try {
+        await apiAxios.get('/backup/daily');
+    } catch (_) {
+        // фоновая операция — ошибки молча проглатываем,
+        // чтобы не мешать загрузке главной страницы
+    }
+}
+
 // SERVER - подгружает все типы бизнеса
 async function loadTypeBusinesses() {
     optionsLoading.value = true;
@@ -352,6 +364,9 @@ function cancelAddQuery() {
 // ============================================================
 
 onMounted(async () => {
+    // фоновый ежедневный бэкап БД (без await — не блокирует загрузку UI)
+    ensureDailyBackup();
+
     await loadTypeBusinesses();
 
     // если type business восстановлен из sessionStorage — подгружаем
