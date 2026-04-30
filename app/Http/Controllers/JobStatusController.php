@@ -31,8 +31,6 @@ class JobStatusController extends BaseController
             }
         }
 
-        \Log::info('[JobStatus] sizes=' . json_encode($sizes) . ' running=' . ($running ? '1' : '0') . ' driver=' . config('queue.default'));
-
         return $this->getSuccessResponse('', ['running' => $running]);
     }
 }

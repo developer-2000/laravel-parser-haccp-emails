@@ -11,11 +11,12 @@ RUN apt-get update && apt-get install -y \
     libpng-dev \
     libonig-dev \
     libxml2-dev \
+    libicu-dev \
     ca-certificates \
     gnupg \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
-    && docker-php-ext-install pdo pdo_mysql mbstring zip exif pcntl \
+    && docker-php-ext-install pdo pdo_mysql mbstring zip exif pcntl intl \
     && pecl install redis \
     && docker-php-ext-enable redis \
     && mkdir -p /var/log/supervisor \

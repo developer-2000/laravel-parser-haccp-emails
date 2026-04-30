@@ -66,7 +66,11 @@ return [
             'driver' => 'redis',
             'connection' => 'default',
             'queue' => env('REDIS_QUEUE', 'default'),
-            'retry_after' => 90,
+            // ВАЖНО: retry_after > всех Horizon timeout'ов (см. config/horizon.php).
+            // Если retry_after < timeout — Horizon ставит копию Job'а в очередь
+            // ПОКА оригинал ещё работает → дубли обработки. CrawlJob может идти
+            // до 600 сек (49 contact-paths × до 8 сек), поэтому retry_after = 900.
+            'retry_after' => 900,
             'block_for' => null,
             'after_commit' => false,
         ],

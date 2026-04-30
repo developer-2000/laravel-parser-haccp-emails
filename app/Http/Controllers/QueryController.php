@@ -4,7 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Http\Requests\ShowQueryRequest;
 use App\Jobs\SearchJob;
-use App\Models\Company;
+use App\Jobs\SearchJobInput;
 use App\Models\ParsingState;
 use App\Models\SearchQuery;
 use App\Services\AppLogger;
@@ -36,38 +36,42 @@ class QueryController extends BaseController
         $languageId     = $query->language_id;
 
 
-        // 1 Проверка что этот парсинг ещё не завершён
-        $state = ParsingState::firstOrNew([
-            'language_id' => $languageId,
-            'type_business_id' => $typeBusinessId,
-        ]);
+        // 1 Получить или создать запись ParsingState для пары (lang + type).
+        //    Семантика ключа — пара (language_id, type_business_id), а не
+        //    search_query_id: разные SearchQuery с одной парой рассматриваются
+        //    как разные формулировки одного и того же продуктового парсинга.
+        //    firstOrCreate гарантирует, что запись точно есть в БД — никаких
+        //    "unsaved модель и непонятно что в полях".
+        $state = ParsingState::firstOrCreate(
+            [
+                'language_id'      => $languageId,
+                'type_business_id' => $typeBusinessId,
+            ],
+            [
+                'completion_status' => 0,
+                'next_page_params'  => null,
+            ]
+        );
 
-        if ($state->exists && $state->completion_status === 1) {
+        if ($state->completion_status === 1) {
             return $this->getSuccessResponse('Этот парсинг завершен');
         }
 
-        // 2 Зафиксировать начало парсинга этого сета.
-        //    next_page_params НЕ затираем — если он есть, это указатель на страницу,
-        //    с которой надо возобновить прерванный прогон.
-        $state->completion_status = 0;
-        $state->save();
+        // 2 Поставить в очередь обработку этого запроса.
+        //    Стартуем с iteration=0; режим определяется наличием nextPageParams:
+        //    если null — bare search (s=0), если есть cursor — resume с этой страницы.
+        //    Парсер обходит SERP до конца (markCompleted при null-next-page).
+        $input = new SearchJobInput(
+            searchQueryId:   $searchQueryId,
+            textQuery:       $query->text,
+            languageCode:    $languageCode,
+            typeBusinessId:  $typeBusinessId,
+            languageId:      $languageId,
+            iteration:       0,
+            nextPageParams:  $state->next_page_params,
+        );
 
-        // 3 Поставить в очередь обработку этого запроса.
-        //    Если есть сохранённые параметры пагинации — стартуем с iteration=1
-        //    и этими параметрами (resume), иначе обычный bare search с нуля.
-        $resumeParams = $state->next_page_params;
-        $iteration    = $resumeParams ? 1 : 0;
-
-        SearchJob::dispatch(
-            $searchQueryId,
-            $query->text,
-            $languageCode,
-            $typeBusinessId,
-            $languageId,
-            $iteration,
-            0,
-            $resumeParams
-        )->onQueue('search');
+        SearchJob::dispatch($input)->onQueue('search');
 
         return $this->getSuccessResponse('', ['query' => $query->text]);
     }

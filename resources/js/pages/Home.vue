@@ -39,69 +39,26 @@
             </div>
 
             <!-- Search query -->
-            <div class="custom-page-column">
-                <div class="box-select">
-                    <!-- 1 Select Search query -->
-                    <n-form-item
-                        :show-feedback="false"
-                    >
-                        <!-- Label and Button (add)-->
-                        <template #label>
-                            <div class="label-with-button">
-                                <span>Поисковый запрос</span>
-                                <n-button
-                                    v-if="!searchAddMode"
-                                    size="tiny"
-                                    strong secondary type="info"
-                                    :disabled="!typeBusinessId"
-                                    @click="openAddQuery"
-                                >
-                                    Добавить
-                                </n-button>
-                            </div>
-                        </template>
-
-                        <div class="select-with-counter">
-                            <n-select
-                                v-model:value="searchQueryId"
-                                :options="searchQueryOptions"
-                                :loading="searchOptionsLoading"
-                                :disabled="!typeBusinessId"
-                                filterable
-                                clearable
-                                placeholder="Выберите запрос"
-                                class="type-business-select"
-                            />
-                        </div>
-                    </n-form-item>
-                    <!-- Количество элементов в select -->
-                    <span class="select-counter">{{ searchQueryOptions.length }}</span>
-                </div>
-
-                <!-- 2 Input ADD Search query -->
+            <div
+                v-if="typeBusinessId && searchQueryChecked"
+                class="custom-page-column"
+            >
                 <n-form-item
-                    v-if="searchAddMode"
+                    label="Поисковый запрос"
                     :show-feedback="false"
-                    label="Новый запрос"
-                    class="section-add-business"
                 >
                     <n-input
-                        v-model:value="searchNewName"
+                        v-model:value="searchQueryText"
+                        :disabled="hasSearchQuery || searchSaving"
                         placeholder="Текст запроса"
-                        :disabled="searchSaving"
-                        @keydown.enter="saveNewQuery"
+                        @keydown.enter="saveSearchQuery"
                     />
                     <n-button
-                        :disabled="searchSaving"
-                        @click="cancelAddQuery"
-                    >
-                        Отмена
-                    </n-button>
-                    <n-button
+                        v-if="!hasSearchQuery"
                         type="primary"
                         :loading="searchSaving"
-                        :disabled="!searchNewName.trim()"
-                        @click="saveNewQuery"
+                        :disabled="!searchQueryText.trim()"
+                        @click="saveSearchQuery"
                     >
                         Сохранить
                     </n-button>
@@ -117,7 +74,7 @@
 // ============================================================
 // IMPORTS
 // ============================================================
-import { ref, watch, onMounted, onBeforeUnmount } from 'vue';
+import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue';
 import apiAxios from '@/utils/apiAxios.js';
 import { useLanguageStore } from '@/stores/language.js';
 
@@ -130,13 +87,6 @@ const languageStore = useLanguageStore();
 // ключ sessionStorage для запомненного выбора типа бизнеса
 const TYPE_BUSINESS_KEY = 'home.typeBusinessId';
 
-// контекстный ключ sessionStorage для выбора запроса:
-// у каждой пары (язык + тип бизнеса) свой запомненный выбор —
-// при возврате к этой паре select восстанавливается.
-function searchQueryKey(languageCode, typeBusinessIdValue) {
-    return `home.searchQueryId.${languageCode}.${typeBusinessIdValue}`;
-}
-
 // ============================================================
 // STATE
 // ============================================================
@@ -147,7 +97,13 @@ const loading = ref(false);
 // идёт ли сейчас обработка очередей search/crawl на сервере
 const isRunning = ref(false);
 
-// id таймера опроса статуса очередей
+// Адаптивный polling статуса очередей.
+// При активном парсинге опрашиваем часто (UI должен быстро отразить
+// завершение); в idle — редко, чтобы не дёргать сервер раз в 3 сек впустую.
+const POLL_RUNNING_MS = 3000;
+const POLL_IDLE_MS = 30000;
+
+// id таймера следующей проверки статуса очередей (setTimeout, не setInterval)
 let jobStatusTimer = null;
 
 // type business — select + options (инициализация из sessionStorage)
@@ -162,17 +118,22 @@ const typeBusinessId = ref(storedTypeBusinessId);
 const typeBusinessOptions = ref([]);
 const optionsLoading = ref(false);
 
-// search query — select + options.
-// Стартовое значение = null, после загрузки опций восстанавливаем
-// сохранённое значение из sessionStorage по ключу (lang + typeId).
+// search query: одна запись на пару (typeBusiness + language).
+// searchQueryId = id существующего SearchQuery в БД, или null если нет.
+// searchQueryText = текст в input'е (readonly если есть, либо для ввода нового).
 const searchQueryId = ref(null);
-const searchQueryOptions = ref([]);
-const searchOptionsLoading = ref(false);
-
-// search query — форма «Добавить»
-const searchAddMode = ref(false);
-const searchNewName = ref('');
+const searchQueryText = ref('');
 const searchSaving = ref(false);
+
+// Главный маяк состояния SearchQuery для текущей пары:
+//   false — мы ещё не знаем, есть ли запись в БД (loading или ничего не выбрано);
+//   true  — запрос к серверу завершился, состояние известно (запись есть либо нет).
+// Колонка показывается только когда checked === true.
+const searchQueryChecked = ref(false);
+
+// true когда для текущей пары (typeBusiness + language) уже есть SearchQuery
+// в БД → input disabled, кнопки "Сохранить" нет.
+const hasSearchQuery = computed(() => searchQueryId.value !== null);
 
 // ============================================================
 // WATCHERS
@@ -187,36 +148,20 @@ watch(typeBusinessId, (val) => {
     }
 });
 
-// при смене типа бизнеса перезагружаем список запросов и пробуем
-// восстановить выбор для новой пары (lang + typeId)
+// при смене типа бизнеса перезагружаем SearchQuery для пары (lang + typeId)
 watch(typeBusinessId, (val) => {
+    searchQueryChecked.value = false;
     if (val) {
-        loadSearchQueries(val);
+        loadSearchQuery(val);
     } else {
-        searchQueryOptions.value = [];
-        searchQueryId.value = null;
+        resetSearchQueryState();
     }
 });
 
 // при смене языка — то же самое
 watch(() => languageStore.current, (val, prev) => {
     if (val !== prev && typeBusinessId.value) {
-        loadSearchQueries(typeBusinessId.value);
-    }
-});
-
-// сохраняем выбор search query по контекстному ключу (lang + typeId).
-// null = удаляем ключ для текущей пары.
-watch(searchQueryId, (val) => {
-    const lang = languageStore.current;
-    const typeId = typeBusinessId.value;
-    if (!lang || !typeId) return;
-
-    const key = searchQueryKey(lang, typeId);
-    if (val === null || val === undefined) {
-        sessionStorage.removeItem(key);
-    } else {
-        sessionStorage.setItem(key, String(val));
+        loadSearchQuery(typeBusinessId.value);
     }
 });
 
@@ -240,8 +185,11 @@ async function sendQuery() {
 
     loading.value = false;
 
-    // сразу проверим статус — задача только что попала в очередь, кнопка должна заблокироваться
-    checkJobStatus();
+    // сразу проверим статус — задача только что попала в очередь, кнопка
+    // должна заблокироваться. После update'а isRunning перезапускаем
+    // таймер, чтобы цепочка polling'а сразу перешла на быстрый интервал.
+    await checkJobStatus();
+    scheduleNextJobStatusCheck();
 }
 
 // SERVER - проверяет, идёт ли обработка задач в очередях search/crawl
@@ -250,6 +198,23 @@ async function checkJobStatus() {
     if (response?.status === 'success') {
         isRunning.value = !!response?.data?.running;
     }
+}
+
+// Запланировать следующую проверку статуса очередей с задержкой,
+// зависящей от текущего isRunning. Когда состояние меняется (например,
+// после sendQuery — running ставит true), цепочка автоматически переходит
+// на быстрый интервал.
+function scheduleNextJobStatusCheck() {
+    if (jobStatusTimer !== null) {
+        clearTimeout(jobStatusTimer);
+    }
+
+    const delay = isRunning.value ? POLL_RUNNING_MS : POLL_IDLE_MS;
+
+    jobStatusTimer = setTimeout(async () => {
+        await checkJobStatus();
+        scheduleNextJobStatusCheck();
+    }, delay);
 }
 
 // SERVER - тихий ежедневный бэкап БД.
@@ -288,42 +253,40 @@ async function loadTypeBusinesses() {
     optionsLoading.value = false;
 }
 
-// SERVER - подгружает поисковые запросы для выбранного типа бизнеса
-async function loadSearchQueries(typeBusinessIdValue) {
+// SERVER - подгружает существующий SearchQuery для пары (typeBusiness + language).
+// На паре может быть только одна запись; берём первую из массива (бэкенд возвращает list).
+// Если записи нет — input остаётся пустым и доступным для ввода.
+async function loadSearchQuery(typeBusinessIdValue) {
     if (!typeBusinessIdValue) return;
 
-    const lang = languageStore.current;
+    searchQueryChecked.value = false;
 
-    searchOptionsLoading.value = true;
     const response = await apiAxios.get('/search-queries', {
         type_business_id: typeBusinessIdValue,
-        language_code: lang,
+        language_code: languageStore.current,
     });
 
     if (response?.status === 'success') {
         const { items } = response?.data;
-        searchQueryOptions.value = items ?? [];
+        const first = (items ?? [])[0] ?? null;
 
-        // восстанавливаем сохранённый выбор для пары (lang + typeId).
-        // если ключа нет, или saved id не в options (запись удалили) — null.
-        const raw = sessionStorage.getItem(searchQueryKey(lang, typeBusinessIdValue));
-        const savedId = raw !== null && raw !== '' && Number.isFinite(Number(raw))
-            ? Number(raw)
-            : null;
-
-        searchQueryId.value = savedId !== null
-            && searchQueryOptions.value.some((o) => o.value === savedId)
-            ? savedId
-            : null;
+        if (first) {
+            searchQueryId.value = first.value;
+            searchQueryText.value = first.label ?? first.text ?? '';
+        } else {
+            resetSearchQueryState();
+        }
     }
 
-    searchOptionsLoading.value = false;
+    searchQueryChecked.value = true;
 }
 
-// SERVER - Создать новый поисковый запрос
-async function saveNewQuery() {
-    const text = searchNewName.value.trim();
-    if (!text || searchSaving.value || !typeBusinessId.value) return;
+// SERVER - создать SearchQuery для текущей пары (typeBusiness + language).
+// После успешного create фиксируем id+text — input становится disabled,
+// кнопка "Сохранить" исчезает, можно сразу нажимать "Отправить".
+async function saveSearchQuery() {
+    const text = searchQueryText.value.trim();
+    if (!text || searchSaving.value || !typeBusinessId.value || hasSearchQuery.value) return;
 
     searchSaving.value = true;
 
@@ -331,32 +294,24 @@ async function saveNewQuery() {
         text,
         type_business_id: typeBusinessId.value,
         language_code: languageStore.current,
-    }
+    };
 
     const response = await apiAxios.post('/search-queries', params);
 
     if (response?.status === 'success' && response?.data?.item) {
         const item = response.data.item;
-        searchQueryOptions.value = [...searchQueryOptions.value, item];
         searchQueryId.value = item.value;
-        cancelAddQuery();
+        searchQueryText.value = item.label ?? item.text ?? text;
     }
 
     searchSaving.value = false;
 }
 
-// ============================================================
-// UI METHODS
-// ============================================================
-
-function openAddQuery() {
-    searchAddMode.value = true;
-    searchNewName.value = '';
-}
-
-function cancelAddQuery() {
-    searchAddMode.value = false;
-    searchNewName.value = '';
+// Сброс состояния SearchQuery: для случаев "тип бизнеса не выбран"
+// или "для пары пока нет SearchQuery в БД".
+function resetSearchQueryState() {
+    searchQueryId.value = null;
+    searchQueryText.value = '';
 }
 
 // ============================================================
@@ -370,19 +325,20 @@ onMounted(async () => {
     await loadTypeBusinesses();
 
     // если type business восстановлен из sessionStorage — подгружаем
-    // соответствующий список запросов (watch не сработает, т.к. значение не менялось)
+    // соответствующий SearchQuery (watch не сработает, т.к. значение не менялось)
     if (typeBusinessId.value) {
-        await loadSearchQueries(typeBusinessId.value);
+        await loadSearchQuery(typeBusinessId.value);
     }
 
-    // проверяем статус очередей и запускаем периодический опрос (раз в 3 секунды)
+    // проверяем статус очередей и запускаем адаптивный polling
+    // (3 сек когда running, 30 сек когда idle)
     await checkJobStatus();
-    jobStatusTimer = setInterval(checkJobStatus, 3000);
+    scheduleNextJobStatusCheck();
 });
 
 onBeforeUnmount(() => {
-    if (jobStatusTimer) {
-        clearInterval(jobStatusTimer);
+    if (jobStatusTimer !== null) {
+        clearTimeout(jobStatusTimer);
         jobStatusTimer = null;
     }
 });
@@ -405,13 +361,11 @@ onBeforeUnmount(() => {
     }
 
     .custom-page-row {
-        display: flex;
-        flex-flow: row nowrap;
+        display: grid;
+        grid-template-columns: 1fr 1fr;
         gap: 24px;
 
-        // все дочерние первого уровня — одинаковой ширины (flex-basis: 0 + grow: 1)
         > * {
-            flex: 1 1 0;
             min-width: 0;
         }
     }
@@ -475,9 +429,10 @@ onBeforeUnmount(() => {
 }
 :deep(.n-form-item-blank) {
     display: flex;
-    align-items: center;
+    align-items: baseline;
     gap: 8px;
-    input{
+    min-height: 34px;
+    input {
         flex: 1 1 auto;
     }
 }

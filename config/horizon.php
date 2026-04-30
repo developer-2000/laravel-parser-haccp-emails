@@ -202,7 +202,7 @@ return [
             'queue' => ['search'],
             'balance' => 'simple',
             'minProcesses' => 1,
-            'maxProcesses' => 3,
+            'maxProcesses' => 2,
             'memory' => 256,
             'tries' => 3,
             'timeout' => 300,
@@ -214,56 +214,26 @@ return [
             'minProcesses' => 1,
             'maxProcesses' => 5,
             'memory' => 512,
-            'tries' => 3,
-            'timeout' => 300,
-        ],
-        'classify' => [
-            'connection' => 'redis',
-            'queue' => ['classify'],
-            'balance' => 'simple',
-            'minProcesses' => 1,
-            'maxProcesses' => 2,
-            'memory' => 256,
-            'tries' => 3,
-            'timeout' => 120,
-        ],
-        'enrich' => [
-            'connection' => 'redis',
-            'queue' => ['enrich'],
-            'balance' => 'simple',
-            'minProcesses' => 1,
-            'maxProcesses' => 2,
-            'memory' => 256,
-            'tries' => 3,
-            'timeout' => 120,
-        ],
-        'save' => [
-            'connection' => 'redis',
-            'queue' => ['save'],
-            'balance' => 'simple',
-            'minProcesses' => 1,
-            'maxProcesses' => 1,
-            'memory' => 256,
-            'tries' => 3,
-            'timeout' => 60,
+            // tries=1 — без auto-retry. Если CrawlJob падает на одном сайте,
+            // не нужно гонять его ещё раз: всё равно 49 contact-paths уже
+            // обошли впустую, повтор не даст другого результата.
+            'tries' => 1,
+            // timeout=600 (10 мин) покрывает worst-case: медленный сайт где
+            // каждый из 49 contact-paths отвечает по 8-12 секунд.
+            // ОБЯЗАТЕЛЬНО: timeout < retry_after в config/queue.php.
+            'timeout' => 600,
         ],
     ],
 
     'environments' => [
         'production' => [
-            'search'   => ['maxProcesses' => 5],
-            'crawl'    => ['maxProcesses' => 10],
-            'classify' => ['maxProcesses' => 4],
-            'enrich'   => ['maxProcesses' => 4],
-            'save'     => ['maxProcesses' => 2],
+            'search' => ['maxProcesses' => 3],
+            'crawl'  => ['maxProcesses' => 10],
         ],
 
         'local' => [
-            'search'   => ['maxProcesses' => 3],
-            'crawl'    => ['maxProcesses' => 3],
-            'classify' => ['maxProcesses' => 2],
-            'enrich'   => ['maxProcesses' => 2],
-            'save'     => ['maxProcesses' => 1],
+            'search' => ['maxProcesses' => 2],
+            'crawl'  => ['maxProcesses' => 5],
         ],
     ],
 

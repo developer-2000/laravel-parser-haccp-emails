@@ -4,7 +4,11 @@ namespace App\Jobs;
 
 use App\Models\Company;
 use App\Services\AppLogger;
+use App\Services\HtmlEncoding;
 use App\Services\LeadClassifier;
+use libphonenumber\NumberParseException;
+use libphonenumber\PhoneNumberFormat;
+use libphonenumber\PhoneNumberUtil;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -54,6 +58,41 @@ class CrawlJob implements ShouldQueue
     ];
 
     /**
+     * Таймаут (сек) на один HTTP-запрос внутри fetch().
+     *
+     * 20 сек — соответствует прежнему быстрому-полному поведению. 99% живых
+     * сайтов отвечают за 1-2 сек, 20 покрывает редкие медленные хостинги.
+     * Для несуществующих путей сервер обычно отвечает 404/500 моментально,
+     * так что обход CONTACT_PATHS не растягивается.
+     */
+    private const FETCH_TIMEOUT = 20;
+
+    /**
+     * Username-часть email — буквы/цифры и `._%+-` (согласно RFC 5322 lite).
+     * Используется как стройблок в EMAIL_REGEX и в regex'ах JSON-/JS-форматов.
+     */
+    private const EMAIL_USER = '[a-zA-Z0-9._%+-]+';
+
+    /**
+     * Domain-часть email — `host.tld` с TLD 2..6 латинских символов
+     * (длиннее уже подозрительно — обычно склейка domain+text после strip_tags).
+     */
+    private const EMAIL_DOMAIN = '[a-zA-Z0-9.-]+\.[a-zA-Z]{2,6}';
+
+    /**
+     * Свободный email-regex: ловит адрес в произвольном тексте.
+     * Lookahead `(?![a-zA-Z])` исключает захват "deUmsatzsteuer..." после ".de" —
+     * типичная склейка после strip_tags соседних блоков HTML.
+     */
+    private const EMAIL_REGEX = '/' . self::EMAIL_USER . '@' . self::EMAIL_DOMAIN . '(?![a-zA-Z])/';
+
+    /**
+     * Anchored-вариант — для финальной валидации одной целой строки,
+     * прошедшей через urldecode/html_entity_decode (extractMailtoEmails).
+     */
+    private const EMAIL_REGEX_ANCHORED = '/^' . self::EMAIL_USER . '@' . self::EMAIL_DOMAIN . '$/';
+
+    /**
      * URL компании, которую мы будем скрапить
      * (это домен из SearchJob)
      */
@@ -66,6 +105,27 @@ class CrawlJob implements ShouldQueue
      */
     public ?int $typeBusinessId;
 
+    /**
+     * Логгер для записи в crawl.log.
+     *
+     * Остаётся null до начала handle() — там присваивается резолвнутый из DI
+     * экземпляр и используется всеми приватными pipeline-методами через
+     * $this->logger. Поле НЕ должно попадать в payload очереди: Job всегда
+     * сериализуется ДО handle (когда $this->logger === null), а после handle
+     * ре-сериализации не происходит.
+     */
+    private ?AppLogger $logger = null;
+
+    /**
+     * Сервис приведения HTML к валидному UTF-8.
+     *
+     * Зачем: сырые байты non-UTF-8 .de-сайтов ломают INSERT в utf8mb4-таблицы.
+     * Используется в fetch() сразу после получения тела ответа. Поле остаётся
+     * null до handle(), где резолвится через DI — ровно по той же схеме, что
+     * и $this->logger (не должно попадать в payload очереди).
+     */
+    private ?HtmlEncoding $encoder = null;
+
     public function __construct(string $url, int $searchQueryId, ?int $typeBusinessId = null)
     {
         $this->url = $url;
@@ -75,159 +135,143 @@ class CrawlJob implements ShouldQueue
 
     /**
      * ОСНОВНОЙ PIPELINE:
-     * 1. скачать HTML главной страницы
-     * 2. извлечь базовые данные (email, phone, title)
-     * 3. пройти по мультиязычному списку контактных страниц (CONTACT_PATHS)
-     * 4. объединить данные
-     * 5. очистить и дедуплицировать
-     * 6. сохранить в БД как компанию
+     * 1. скачать HTML главной страницы и проверить, что сайт не off-topic / не низкий tier;
+     * 2. собрать email/phone с homepage + CONTACT_PATHS + menuLinks;
+     * 3. очистить, отфильтровать и сохранить компанию в БД.
      */
-    public function handle(AppLogger $logger, LeadClassifier $classifier): void
+    public function handle(AppLogger $logger, LeadClassifier $classifier, HtmlEncoding $encoder): void
     {
-        // лог начала обработки URL
-        $logger->write('CrawlJob START: ' . $this->url, 'crawl.log');
+        $this->logger = $logger;
+        $this->encoder = $encoder;
+        $startedAt = microtime(true);
 
-        /**
-         * STEP 1:
-         * загрузка HTML главной страницы сайта
-         */
-        $html = $this->fetch($this->url);
+        $this->log('===== CrawlJob START: ' . $this->url . ' =====');
 
-        /**
-         * защита от пустых/битых страниц
-         * (если сайт блокирует или отдаёт мусор)
-         */
-        if (!$html || strlen($html) < 1000) {
-            $logger->write('EMPTY HTML: ' . $this->url, 'crawl.log');
+        $html = $this->fetchHomepage();
+        if ($html === null) {
+            $this->log('  pipeline aborted: empty homepage');
             return;
         }
 
-        /**
-         * STEP 1.5 — Off-topic фильтр (Tier 2).
-         * До любых extract'ов и до записи в БД проверяем title на маркеры не-производителей:
-         * Anlagenbau / Maschinenbau / Edelstahl / Verband / Großhandel / Logistik /
-         * Versicherung / Steuerberater / Statistik / "Human Verification" / "Security Check".
-         * Если матчится — сайт точно не мясной производитель → ничего не пишем в БД.
-         */
-        if ($this->isOffTopic($html)) {
-            $logger->write('OFF-TOPIC: ' . $this->url, 'crawl.log');
+        $title = $this->extractTitle($html);
+        $this->log('  TITLE: ' . ($title ?? '(null)'));
+
+        if ($this->isOffTopic($title)) {
+            $this->log('  OFF-TOPIC drop (title matched off-topic patterns)');
             return;
         }
 
-        /**
-         * STEP 1.6 — Финальная классификация лида через LeadClassifier.
-         *
-         * Считает tier 0..3 на основе сигналов URL и HTML:
-         *   0 — IGNORE  (drop)
-         *   1 — WEAK    (drop, только premium лиды доходят до записи в БД)
-         *   2 — GOOD    (сохраняем)
-         *   3 — IDEAL   (сохраняем)
-         *
-         * Порог tier < 2 — компания не пишется в БД. Это убирает D2C-бренды,
-         * розничных мясников и компании без сильных ICP-сигналов.
-         */
         $tier = $classifier->classify($this->url, $html, $this->typeBusinessId);
-        $logger->write("LEAD TIER: {$tier} {$this->url}", 'crawl.log');
-
-        if ($tier < 2) {
-            $logger->write("LOW TIER DROP: tier={$tier} {$this->url}", 'crawl.log');
+        $this->log("  LEAD TIER: {$tier}");
+        if (!$classifier->passesCrawl($tier)) {
+            $this->log("  LOW TIER DROP (tier={$tier} < " . LeadClassifier::MIN_TIER_FOR_CRAWL . ')');
             return;
         }
 
-        /**
-         * STEP 2:
-         * извлечение базовых данных с главной страницы
-         */
-        $emails = $this->extractEmails($html);   // email через regex
-        $phones = $this->extractPhones($html);   // телефоны через regex
+        [$emails, $phones] = $this->collectContacts($html);
 
-        /**
-         * извлекаем title сайта как fallback название компании
-         */
-        $companyName = $this->extractTitle($html);
+        $this->persistCompany($title, $tier, $emails, $phones);
 
-        /**
-         * STEP 3:
-         * проходим по мультиязычному списку контактных страниц
-         * (CONTACT_PATHS) и собираем email/phone со всех существующих.
-         * Для редких языков работает STEP 5.5 (extractMenuContactLinks).
-         */
+        $duration = round(microtime(true) - $startedAt, 2);
+        $this->log("===== CrawlJob END: {$this->url} (took {$duration}s) =====");
+    }
+
+    /**
+     * Шорткат для записи строки в crawl.log с двухпробельным отступом
+     * для under-stage-логов (визуально выделяет иерархию START/END).
+     */
+    private function log(string $message): void
+    {
+        $this->logger->writeFile($message, 'crawl.log');
+    }
+
+    /**
+     * Скачать HTML главной страницы и сделать sanity-check.
+     *
+     * Возвращает null, если страница не загрузилась или слишком короткая
+     * (< 1000 байт — обычно сайт-заглушка / блокировка / редирект на пустоту).
+     * В этом случае пишет EMPTY HTML в crawl.log — saller просто делает return.
+     */
+    private function fetchHomepage(): ?string
+    {
+        $startedAt = microtime(true);
+        $html = $this->fetch($this->url);
+        $duration = round(microtime(true) - $startedAt, 2);
+
+        if (!$html) {
+            $this->log("  HOMEPAGE: fetch FAIL (null body) after {$duration}s");
+            return null;
+        }
+
+        $bytes = strlen($html);
+        if ($bytes < 1000) {
+            $this->log("  HOMEPAGE: TOO SHORT (bytes={$bytes}, threshold=1000) after {$duration}s — skipping");
+            return null;
+        }
+
+        $this->log("  HOMEPAGE: ok (bytes={$bytes}) after {$duration}s");
+
+        return $html;
+    }
+
+    /**
+     * Собрать email и phone с homepage, CONTACT_PATHS и menu-links.
+     *
+     * Pipeline:
+     *   1. Извлечение с homepage (HTML уже в руках, fetch не нужен).
+     *   2. Полный обход CONTACT_PATHS (мультиязычные шаблоны: contact, kontakt, ...).
+     *   3. Обход найденных в меню ссылок (fleischer-proesch.de/?pageid=11 и т.п.).
+     *
+     * @return array{0: list<string>, 1: list<string>} Накопленные [emails, phones]
+     *         (без финальной очистки/фильтрации — это делает persistCompany).
+     */
+    private function collectContacts(string $html): array
+    {
+        $emails = $this->extractEmails($html);
+        $phones = $this->extractPhones($html);
+
         $base = rtrim($this->url, '/');
         foreach (self::CONTACT_PATHS as $path) {
-            $pageHtml = $this->fetch($base . '/' . $path . '/');
-            if (!$pageHtml) {
-                continue;
-            }
-            $emails = array_merge($emails, $this->extractEmails($pageHtml));
-            $phones = array_merge($phones, $this->extractPhones($pageHtml));
+            [$emails, $phones] = $this->collectContactsFrom($base . '/' . $path . '/', $emails, $phones);
         }
 
-        /**
-         * STEP 5.5:
-         * поиск контактных ссылок в меню главной страницы.
-         *
-         * Зачем: CMS типа typo3/joomla с pageid-навигацией отдают контакты
-         * по нестандартным URL вроде /index.php?pageid=11, и шаблонные
-         * /impressum/ + /kontakt/ выше дадут 404. Здесь читаем <a href>
-         * с текстом ссылки = Kontakt/Contact/Impressum/Anfahrt и идём
-         * прямо по найденному URL (только same-domain, дедуп).
-         *
-         * Пример (fleischer-proesch.de): меню "Kontakt" → ?pageid=11.
-         */
-        $menuLinks = $this->extractMenuContactLinks($html, $this->url);
-        foreach ($menuLinks as $menuUrl) {
-            $menuHtml = $this->fetch($menuUrl);
-            if (!$menuHtml) {
-                continue;
-            }
-            $emails = array_merge($emails, $this->extractEmails($menuHtml));
-            $phones = array_merge($phones, $this->extractPhones($menuHtml));
+        foreach ($this->extractMenuContactLinks($html, $this->url) as $menuUrl) {
+            [$emails, $phones] = $this->collectContactsFrom($menuUrl, $emails, $phones);
         }
 
-        /**
-         * STEP 6:
-         * очистка данных:
-         * - убираем дубликаты
-         * - убираем null/empty
-         */
-        $emails = array_values(array_unique(array_filter($emails)));
+        return [$emails, $phones];
+    }
+
+    /**
+     * Финальная очистка контактов и upsert компании в БД.
+     *
+     * Шаги:
+     *   1. дедуп email/phone, убираем пустые;
+     *   2. фильтрация шаблонных/tracking email'ов через filterEmails;
+     *   3. Company::updateOrCreate по уникальному url;
+     *   4. финальный DONE-лог с метриками.
+     */
+    private function persistCompany(?string $companyName, int $tier, array $emails, array $phones): void
+    {
+        $emails = $this->filterEmails(array_values(array_unique(array_filter($emails))));
         $phones = array_values(array_unique(array_filter($phones)));
 
-        /**
-         * STEP 7:
-         * фильтрация мусорных email (test/example/dummy)
-         */
-        $emails = $this->filterEmails($emails);
-
-        /**
-         * STEP 8:
-         * сохранение/обновление компании в базе
-         *
-         * ключ:
-         * - url (уникальность)
-         *
-         * данные:
-         * - name
-         * - emails
-         * - phones
-         * - raw_checked = обработан ли сайт
-         */
+        $existed = Company::where('url', $this->url)->exists();
         Company::updateOrCreate(
             ['url' => $this->url],
             [
-                'name' => $companyName,
-                'emails' => json_encode($emails),
-                'phones' => json_encode($phones),
-                'tier' => $tier,
+                'name'            => $companyName,
+                'emails'          => $emails,
+                'phones'          => $phones,
+                'tier'            => $tier,
                 'search_query_id' => $this->searchQueryId,
             ]
         );
 
-        /**
-         * финальный лог результата
-         */
-        $logger->write('CrawlJob DONE: ' . $this->url, 'crawl.log');
-        $logger->write('emails=' . count($emails) . ' phones=' . count($phones), 'crawl.log');
+        $this->log('  ' . ($existed ? 'UPDATED' : 'INSERTED')
+            . ' tier=' . $tier
+            . ' emails=' . count($emails) . (empty($emails) ? '' : ' ' . json_encode($emails, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE))
+            . ' phones=' . count($phones) . (empty($phones) ? '' : ' ' . json_encode($phones, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)));
     }
 
     /**
@@ -244,65 +288,45 @@ class CrawlJob implements ShouldQueue
     private function fetch(string $url): ?string
     {
         try {
-            $response = Http::timeout(20)
+            // Один запрос, без retry — это критично для скорости обхода.
+            // На несуществующем path сервер обычно мгновенно отвечает 404/500
+            // с маленьким body, который extract'ы возвращают пустыми, и мы
+            // двигаемся дальше. Включение retry(...) добавляло 1.5-3 сек
+            // на каждом таком path и растягивало обход на минуты.
+            $response = Http::timeout(self::FETCH_TIMEOUT)
                 ->withHeaders([
                     'User-Agent' => 'Mozilla/5.0',
                     'Accept' => 'text/html',
                 ])
                 ->get($url);
 
-            return $this->toUtf8($response->body());
+            return $this->encoder->toUtf8($response->body());
         } catch (\Throwable $e) {
             return null;
         }
     }
 
     /**
-     * Привести HTML к валидному UTF-8.
+     * Скачать страницу по url и подмешать найденные email/phone к уже накопленным.
      *
-     * Алгоритм:
-     *   1. Если <meta charset=...> или <meta http-equiv="Content-Type" charset=...>
-     *      указывает не-UTF-8 — конвертируем из неё.
-     *   2. Иначе — авто-детект через mb_detect_encoding между UTF-8/ISO-8859-1/Windows-1252.
-     *   3. Если всё равно не UTF-8 валидный — финально прогоняем через mb_convert_encoding
-     *      с заменой неверных байт.
+     * Используется в циклах CONTACT_PATHS и menu-links — там одна и та же
+     * связка fetch → extractEmails + extractPhones → array_merge встречается
+     * повторно. Если fetch вернул null (404 / сетевая ошибка) — возвращаем
+     * пары без изменений.
+     *
+     * @return array{0: list<string>, 1: list<string>} Обновлённые [emails, phones].
      */
-    private function toUtf8(string $body): string
+    private function collectContactsFrom(string $url, array $emails, array $phones): array
     {
-        $encoding = null;
-
-        // 1. Декларация в <meta charset>.
-        if (preg_match('/<meta[^>]*charset=["\']?([\w-]+)/i', $body, $m)) {
-            $declared = strtoupper(trim($m[1]));
-            $declared = match ($declared) {
-                'LATIN1', 'LATIN-1' => 'ISO-8859-1',
-                'CP1252' => 'WINDOWS-1252',
-                default => $declared,
-            };
-            if (in_array($declared, ['ISO-8859-1', 'WINDOWS-1252', 'ISO-8859-15'], true)) {
-                $encoding = $declared;
-            }
+        $pageHtml = $this->fetch($url);
+        if (!$pageHtml) {
+            return [$emails, $phones];
         }
 
-        // 2. Авто-детект если meta-тега нет (или он сказал UTF-8, но байты невалидны).
-        if (!$encoding && !mb_check_encoding($body, 'UTF-8')) {
-            $encoding = mb_detect_encoding(
-                $body,
-                ['UTF-8', 'ISO-8859-1', 'Windows-1252', 'ISO-8859-15'],
-                true
-            ) ?: 'ISO-8859-1';
-        }
-
-        if ($encoding && $encoding !== 'UTF-8') {
-            $body = mb_convert_encoding($body, 'UTF-8', $encoding);
-        }
-
-        // 3. Финальная страховка — заменим оставшиеся невалидные байты.
-        if (!mb_check_encoding($body, 'UTF-8')) {
-            $body = mb_convert_encoding($body, 'UTF-8', 'UTF-8');
-        }
-
-        return $body;
+        return [
+            array_merge($emails, $this->extractEmails($pageHtml)),
+            array_merge($phones, $this->extractPhones($pageHtml)),
+        ];
     }
 
     /**
@@ -327,62 +351,83 @@ class CrawlJob implements ShouldQueue
      */
     private function extractEmails(string $html): array
     {
-        $regex = '/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,6}(?![a-zA-Z])/';
+        return $this->cleanEmailCandidates(array_merge(
+            $this->extractDirect($html),
+            $this->extractObfuscated($html),
+            $this->extractJsonAttr($html),
+            $this->decodeCfEmails($html),
+            $this->extractMailtoEmails($html),
+            $this->extractJsConcatEmails($html),
+        ));
+    }
 
-        // Проход 1: сырой HTML.
-        preg_match_all($regex, $html, $direct);
+    /**
+     * Проход 1 — прямой regex по сырому HTML.
+     *
+     * Ловит email, написанный «в открытую» в тексте, в href, в коде. Базовый
+     * EMAIL_REGEX содержит lookahead `(?![a-zA-Z])`, который защищает от склеек
+     * domain+text после strip_tags соседних блоков.
+     */
+    private function extractDirect(string $html): array
+    {
+        preg_match_all(self::EMAIL_REGEX, $html, $matches);
 
-        // Проход 2: нормализация обфускаций.
-        $normalized = $html;
-        // Заменяем визуальные псевдо-@: ∂ (partial differential), &#64;, &commat;, [at], (at), [@], (@)
+        return $matches[0] ?? [];
+    }
+
+    /**
+     * Проход 2 — нормализация типичных обфускаций и повторный regex.
+     *
+     * Что нормализуем перед поиском:
+     *   - визуальные псевдо-@ (`∂`, `[at]`, `(at)`, `[@]`, `(@)`, `&#64;`, `&commat;`) → `@`;
+     *   - теги заменяем ПРОБЕЛОМ (а не пустой строкой), иначе `strip_tags` склеит
+     *     соседние ячейки таблиц/абзацев, и получим мусор вида
+     *     "telefonverkaufs.ernst@..." (склейка имени и username соседнего mailto);
+     *   - схлопываем пробелы вокруг `@` для кейсов вида "support @ example.com",
+     *     которые иначе не матчатся базовым regex'ом.
+     */
+    private function extractObfuscated(string $html): array
+    {
         $normalized = str_replace(
             ['∂', '&#64;', '&#0064;', '&commat;', '[at]', '(at)', '[@]', '(@)', ' [at] ', ' (at) '],
             '@',
-            $normalized
+            $html
         );
-        // Заменяем теги ПРОБЕЛОМ (а не пустой строкой). strip_tags склеивает соседние
-        // ячейки таблиц/абзацев без разделителя — это даёт мусор вида
-        // "telefonverkaufs.ernst@..." (имя из ячейки + username из мейлто рядом).
         $normalized = preg_replace('/<[^>]+>/', ' ', $normalized);
-        // Схлопываем пробелы вокруг @ — кейс "support [at] example.com" после
-        // подмены [at]→@ оставляет "support @ example.com", который regex не видит.
         $normalized = preg_replace('/([\w._%+-])\s*@\s*([\w.-])/u', '$1@$2', $normalized);
-        preg_match_all($regex, $normalized, $obfuscated);
 
-        // Проход 3: data-email JSON-атрибуты вида {"name":"info","host":"verdie-gmbh.de"}.
-        // CMS экранируют внутренние кавычки как &quot; — берём содержимое атрибута,
-        // декодируем html-entities ОТДЕЛЬНО, потом ищем name/host пару.
-        $jsonEmails = [];
-        if (preg_match_all('/data-email=["\']([^"\']+)["\']/i', $html, $attrMatches)) {
-            foreach ($attrMatches[1] as $rawAttr) {
-                $decoded = html_entity_decode($rawAttr);
-                if (preg_match(
-                    '/"?name"?\s*:\s*"?([a-zA-Z0-9._%+-]+)"?[^}]*?"?host"?\s*:\s*"?([a-zA-Z0-9.-]+\.[a-zA-Z]{2,6})/i',
-                    $decoded,
-                    $m
-                )) {
-                    $jsonEmails[] = $m[1] . '@' . $m[2];
-                }
+        preg_match_all(self::EMAIL_REGEX, $normalized, $matches);
+
+        return $matches[0] ?? [];
+    }
+
+    /**
+     * Проход 3 — извлечение из data-email JSON-атрибутов.
+     *
+     * CMS типа JTL / Shopware / Joomla кладут адрес в атрибут вида
+     * `data-email='{"name":"info","host":"verdie-gmbh.de"}'` и склеивают
+     * через JS на клиенте. Мы декодируем содержимое атрибута (html-entities)
+     * и ловим пару name/host через EMAIL_USER + EMAIL_DOMAIN.
+     */
+    private function extractJsonAttr(string $html): array
+    {
+        if (!preg_match_all('/data-email=["\']([^"\']+)["\']/i', $html, $attrMatches)) {
+            return [];
+        }
+
+        $emails = [];
+        foreach ($attrMatches[1] as $rawAttr) {
+            $decoded = html_entity_decode($rawAttr);
+            if (preg_match(
+                '/"?name"?\s*:\s*"?(' . self::EMAIL_USER . ')"?[^}]*?"?host"?\s*:\s*"?(' . self::EMAIL_DOMAIN . ')/i',
+                $decoded,
+                $m
+            )) {
+                $emails[] = $m[1] . '@' . $m[2];
             }
         }
 
-        // Проход 4: Cloudflare email protection.
-        $cfEmails = $this->decodeCfEmails($html);
-
-        // Проход 5: mailto-ссылки с URL-encoded / HTML-entity содержимым.
-        $mailtoEmails = $this->extractMailtoEmails($html);
-
-        // Проход 6: JS-конкатенация ("info" + "@" + "company.de").
-        $jsConcatEmails = $this->extractJsConcatEmails($html);
-
-        return $this->cleanEmailCandidates(array_merge(
-            $direct[0] ?? [],
-            $obfuscated[0] ?? [],
-            $jsonEmails,
-            $cfEmails,
-            $mailtoEmails,
-            $jsConcatEmails
-        ));
+        return $emails;
     }
 
     /**
@@ -425,7 +470,7 @@ class CrawlJob implements ShouldQueue
      */
     private function extractJsConcatEmails(string $html): array
     {
-        $regex = '/["\']([a-zA-Z0-9._%+-]+)["\']\s*\+\s*["\']@["\']\s*\+\s*["\']([a-zA-Z0-9.-]+\.[a-zA-Z]{2,6})["\']/';
+        $regex = '/["\'](' . self::EMAIL_USER . ')["\']\s*\+\s*["\']@["\']\s*\+\s*["\'](' . self::EMAIL_DOMAIN . ')["\']/';
 
         if (!preg_match_all($regex, $html, $matches, PREG_SET_ORDER)) {
             return [];
@@ -457,7 +502,7 @@ class CrawlJob implements ShouldQueue
         $emails = [];
         foreach ($matches[1] as $raw) {
             $email = urldecode(html_entity_decode($raw));
-            if (preg_match('/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,6}$/', $email)) {
+            if (preg_match(self::EMAIL_REGEX_ANCHORED, $email)) {
                 $emails[] = $email;
             }
         }
@@ -564,27 +609,84 @@ class CrawlJob implements ShouldQueue
 
     private function cleanPhone(string $value): ?string
     {
-        // убираем всё кроме цифр и +
-        $value = preg_replace('/[^0-9+]/', '', $value);
+        $util = PhoneNumberUtil::getInstance();
+        $region = $this->guessRegion();
 
-        // базовая проверка длины
-        if (strlen($value) < 7 || strlen($value) > 15) {
-            return null;
+        try {
+            $obj = $util->parse($value, $region);
+            if ($util->isValidNumber($obj)) {
+                return $util->format($obj, PhoneNumberFormat::E164);
+            }
+        } catch (NumberParseException) {
+            // fallback ниже
         }
 
-        return $value;
+        // Fallback на наивную нормализацию: бывает, что libphonenumber
+        // отказывается парсить мусорные подстроки рядом с "Telefon:" из
+        // strip_tags, но нам важен хотя бы цифровой каркас номера.
+        $digits = preg_replace('/[^0-9+]/', '', $value);
+
+        return strlen($digits) >= 7 && strlen($digits) <= 15 ? $digits : null;
+    }
+
+    /**
+     * Угадать регион по TLD домена для PhoneNumberUtil::parse.
+     *
+     * Если в тексте номер без +country-prefix (типичный кейс DACH-сайтов:
+     * "Telefon: 030 1234567"), libphonenumber требует region-hint, чтобы
+     * понять country code. Берём подсказку из TLD домена самой компании.
+     *
+     * Для непокрытых TLD (например, .com, .eu) возвращаем DE — у нашего
+     * ICP это самый частый регион среди DACH.
+     */
+    private function guessRegion(): string
+    {
+        $host = parse_url($this->url, PHP_URL_HOST) ?? '';
+        $tld = strtolower((string) substr(strrchr($host, '.') ?: '', 1));
+
+        return match ($tld) {
+            'at' => 'AT',
+            'ch' => 'CH',
+            'fr' => 'FR',
+            'be' => 'BE',
+            'lu' => 'LU',
+            'nl' => 'NL',
+            'it' => 'IT',
+            'es' => 'ES',
+            'pt' => 'PT',
+            'pl' => 'PL',
+            'cz' => 'CZ',
+            'sk' => 'SK',
+            'hu' => 'HU',
+            'dk' => 'DK',
+            'se' => 'SE',
+            'no' => 'NO',
+            'fi' => 'FI',
+            'uk', 'gb', 'ie' => 'GB',
+            default => 'DE',
+        };
     }
 
     /**
      * STEP D:
-     * извлечение title страницы
+     * извлечение title страницы.
      *
-     * используется как fallback название компании
+     * Возвращает уже очищенную строку (без HTML-тегов и без html-entity)
+     * — так её можно одновременно положить в БД как fallback-имя компании
+     * и передать в isOffTopic() для проверки маркеров не-производителей,
+     * без повторного парсинга <title> на одном HTML.
+     *
+     * Флаг `s` нужен для многострочного title (DOTALL).
      */
     private function extractTitle(string $html): ?string
     {
-        preg_match('/<title>(.*?)<\/title>/i', $html, $m);
-        return $m[1] ?? null;
+        if (!preg_match('/<title>(.*?)<\/title>/is', $html, $m)) {
+            return null;
+        }
+
+        $title = trim(html_entity_decode(strip_tags($m[1])));
+
+        return $title === '' ? null : $title;
     }
 
     /**
@@ -749,16 +851,16 @@ class CrawlJob implements ShouldQueue
      * почти всегда отражает суть бизнеса. Достаточно для отсечки большинства
      * случаев типа "ten Brink Anlagenbau", "Schleifer Maschinenbau", "VDF Verband".
      *
-     * Если title пустой / отсутствует — возвращаем false (cautious default:
-     * лучше пропустить шум, чем потерять реального производителя).
+     * Принимает уже очищенный title (см. extractTitle) — чтобы не парсить
+     * <title> на одном HTML дважды. Если title пустой / null — возвращаем
+     * false (cautious default: лучше пропустить шум, чем потерять реального
+     * производителя).
      */
-    private function isOffTopic(string $html): bool
+    private function isOffTopic(?string $title): bool
     {
-        if (!preg_match('/<title>(.*?)<\/title>/is', $html, $m)) {
+        if ($title === null || $title === '') {
             return false;
         }
-
-        $title = html_entity_decode(strip_tags($m[1]));
 
         $patterns = [
             // Equipment / промышленное оборудование

@@ -7,187 +7,151 @@ use App\Models\ParsingState;
 use App\Services\AppLogger;
 use App\Services\LeadClassifier;
 use App\Services\PlaywrightService;
+use App\Services\SerpParser;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Queue;
 
 class SearchJob implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    public int $searchQueryId;
-    public string $textQuery;
-
     /**
-     * Код языка ("de" / "en" / …) — нужен для регионализации поиска DuckDuckGo
-     * (kl-параметр) и для записи языка к найденным компаниям.
+     * Random jitter (секунды) перед каждым fetch'ем SERP. Размазывает
+     * исходящие запросы во времени, чтобы DDG не видел чёткого периода.
      */
-    public ?string $languageCode;
+    private const SERP_JITTER = [1, 2];
 
     /**
-     * id типа бизнеса (type_business.id). По нему LeadClassifier выбирает
-     * набор правил из config/site/meat_scoring.php.
-     */
-    public ?int $typeBusinessId;
-
-    /**
-     * id языка (languages.id) — нужен как составной ключ ParsingState
-     * (language_id + type_business_id) для записи прогресса/cursor'а.
-     */
-    public ?int $languageId;
-
-    /**
-     * iteration = логическая "страница" — шаг обхода выдачи.
-     */
-    public int $iteration;
-
-    public int $maxIterations;
-    public int $retry;
-
-    /**
-     * Готовые hidden-поля формы Next из предыдущей страницы.
-     * NULL для первой итерации (тогда делаем bare search).
+     * Расписание задержек (в секундах) между попытками после сбоя итерации.
      *
-     * @var array<string,string>|null
+     * Используется в backoff() — Laravel-механизм. После 1-го фейла ждём 3 сек,
+     * после 2-го — 8 сек. Если 3-я попытка тоже упадёт — Laravel вызовет failed().
      */
-    public ?array $nextPageParams;
+    private const RETRY_BACKOFF_SCHEDULE = [3, 8];
 
-    public function __construct(
-        int $searchQueryId,
-        string $textQuery,
-        ?string $languageCode = null,
-        ?int $typeBusinessId = null,
-        ?int $languageId = null,
-        int $iteration = 0,
-        int $retry = 0,
-        ?array $nextPageParams = null
-    ) {
-        $this->searchQueryId = $searchQueryId;
-        $this->textQuery = $textQuery;
-        $this->languageCode = $languageCode;
-        $this->typeBusinessId = $typeBusinessId;
-        $this->languageId = $languageId;
-        $this->iteration = $iteration;
-        $this->maxIterations = 3;
-        $this->retry = $retry;
-        $this->nextPageParams = $nextPageParams;
+    /**
+     * Delay-окно (секунды) перед переходом к следующей странице SERP.
+     * Не даёт долбить DDG плотным предсказуемым потоком.
+     */
+    private const NEXT_ITER_DELAY = [2, 5];
+
+    /**
+     * Максимум попыток обработки одной итерации (initial + 2 retry).
+     * Управляет Laravel: при throw из handle() job уезжает в очередь с задержкой
+     * из backoff(); после исчерпания — вызывается failed().
+     */
+    public int $tries = 3;
+
+    /**
+     * Параметры запуска: searchQueryId, textQuery, languageCode/Id, typeBusinessId,
+     * iteration, nextPageParams. Подробнее — в SearchJobInput.
+     */
+    public SearchJobInput $input;
+
+    /**
+     * Логгер для записи в search.log / playwright_errors.log.
+     *
+     * Остаётся null до начала handle() — там присваивается резолвнутый из DI
+     * экземпляр и используется всеми приватными методами через $this->logger.
+     * Поле НЕ должно попадать в payload очереди: Job всегда сериализуется ДО
+     * handle (когда $this->logger === null), а после handle ре-сериализации не
+     * происходит — failed_jobs хранят исходный payload.
+     */
+    private ?AppLogger $logger = null;
+
+    public function __construct(SearchJobInput $input)
+    {
+        $this->input = $input;
     }
 
     public function handle(
         AppLogger $logger,
         PlaywrightService $playwright,
-        LeadClassifier $classifier
+        LeadClassifier $classifier,
+        SerpParser $serpParser
     ): void {
+        $this->logger = $logger;
 
-        $logger->write("ИТЕРАЦИЯ = {$this->iteration} попытка={$this->retry}", 'search.log');
-
-        if ($this->iteration >= $this->maxIterations) {
-            $logger->write("[СТОП] достигнут лимит итераций", 'search.log');
-            return;
-        }
-
-        // Зафиксировать cursor ТЕКУЩЕЙ страницы до fetch — чтобы при крахе
-        // в любой точке handle() в БД лежал указатель ровно на ту страницу,
-        // на которой мы упали, и resume точно сюда же вернулся.
-        // На первой итерации nextPageParams=null → запишется null (bare search).
-        $this->saveCursor();
+        $this->logger->writeFile("ИТЕРАЦИЯ = {$this->input->iteration} попытка={$this->attempts()}", 'search.log');
 
         try {
-            sleep(rand(1, 2));
+            sleep(rand(...self::SERP_JITTER));
 
             // 1 Получение HTML страницы выдачи DuckDuckGo для текущей итерации.
-            $html = $this->fetchSerpHtml($playwright, $logger);
+            $html = $this->fetchSerpHtml($playwright);
 
             $bytes = strlen($html);
-            $logger->write("[2] байт={$bytes}", 'search.log');
+            $this->logger->writeFile("[fetch] bytes={$bytes}", 'search.log');
 
-            // ERROR - Проверка валидности ответа DuckDuckGo:
-            // bytes < 5000 → ответ слишком короткий, чтобы быть нормальной
-            // str_contains('captcha') → DDG отдал страницу с защитой от ботов
-            // В обоих случаях бросаем BLOCK_OR_EMPTY — внешний catch в handle()
-            // запустит retry с задержкой (до 3 попыток).
-            if ($bytes < 5000 || str_contains($html, 'captcha')) {
+            // Защита от anomaly-страниц DDG (блокировка / "Unfortunately, bots use DDG too..."):
+            //   - bytes < 5000 — слишком короткий ответ для нормальной SERP.
+            //   - 'captcha' в тексте — явный маркер.
+            //   - НЕТ result__a И НЕТ nav-link — это не страница выдачи вообще
+            //     (структура DDG SERP всегда содержит хотя бы одно из них).
+            // Все три случая throw'ятся → Laravel retry через backoff(). Это критично:
+            // без этой проверки 14k-байтная anomaly-страница без result__a доходила
+            // до markCompleted и ложно ставила completion_status=1.
+            $isAnomaly = $bytes < 5000
+                || str_contains($html, 'captcha')
+                || (!str_contains($html, 'result__a') && !str_contains($html, 'nav-link'));
+            if ($isAnomaly) {
+                $this->dumpEmptyPageHtml($html);
                 throw new \Exception('BLOCK_OR_EMPTY');
             }
 
-            // 2 Извлечение url сайтов из SERP + 3-уровневая дедупликация.
-            $newLinks = $this->extractAndDedupe($html, $logger);
+            $newLinks = $this->extractAndDedupe($html, $serpParser);
 
-            // STOP
-            if (count($newLinks) === 0) {
-                $logger->write("[СТОП] нет новых ссылок после дедупликации", 'search.log');
-                return;
-            }
-
-            // 3 Ранний URL-фильтр через LeadClassifier — отсекаем заведомый
-            //   мусор по сигналам в URL (shop, maschinen, verband и т.п.),
-            //   не тратя CrawlJob на гарантированно нерелевантные сайты.
-            $qualified = $this->filterByClassifier($newLinks, $classifier, $logger);
-
-            // Если на текущей странице SERP ни одного qualified —
-            // НЕ останавливаем обход выдачи. Просто пропускаем dispatch
-            // и идём дальше: на следующих страницах могут быть хорошие URL.
-            $dispatched = 0;
-            if (empty($qualified)) {
-                $logger->write("[пропуск-диспатча] на этой странице ни одного подходящего URL", 'search.log');
+            // Пустая страница — нормальная ситуация на дальних страницах SERP:
+            // все URL либо мусор, либо уже в companies. Это НЕ повод останавливаться —
+            // на следующих страницах могут быть новые домены. Идём дальше.
+            if (empty($newLinks)) {
+                $this->logger->writeFile('[empty-page] нет новых ссылок после dedupe — идём на следующую страницу', 'search.log');
+                $this->dumpEmptyPageHtml($html);
             } else {
-                // 4 Ставим новую задачу в очередь - откроет сайт, извлечёт данные и сохранит контакты в DB
-                foreach ($qualified as $link) {
-                    CrawlJob::dispatch($link, $this->searchQueryId, $this->typeBusinessId)
-                        ->onQueue('crawl');
-
-                    $dispatched++;
+                $qualified = $this->filterByClassifier($newLinks, $classifier);
+                if (!empty($qualified)) {
+                    $this->dispatchCrawlJobs($qualified);
                 }
             }
 
-            $logger->write("[3] отправлено в очередь={$dispatched}", 'search.log');
-
-            // 5 Планируем следующую итерацию (если в выдаче есть следующая страница)
-            $this->scheduleNextIteration($html, $logger);
+            $this->scheduleNextIteration($html, $serpParser);
 
         } catch (\Throwable $e) {
-            $logger->write("[ОШИБКА] {$e->getMessage()} попытка={$this->retry}", 'search.log');
-
-            /**
-             * Retry-механизм при сбое итерации.
-             *
-             * Зачем:
-             *   - DDG может временно отдать captcha, обрезанный ответ или
-             *     уронить Playwright по timeout — это не «фатальные» ошибки,
-             *     при повторе через несколько секунд обычно проходит.
-             *
-             * Что делаем:
-             *   - До 3 повторов на одну и ту же итерацию (retry=0 → 1 → 2 → 3).
-             *   - Переписпатчим тот же SearchJob с теми же параметрами
-             *     (searchQueryId, textQuery, iteration, nextPageParams), но с retry+1.
-             *   - Задержка 3–8 секунд — чтобы не долбить DDG сразу после блока.
-             *   - return — выходим из handle, новая попытка пойдёт уже как
-             *     отдельный job из очереди.
-             *
-             * Если retry достиг 3 — попадаем дальше в [FAIL] лог
-             * и больше не пытаемся.
-             */
-            if ($this->retry < 3) {
-                self::dispatch(
-                    $this->searchQueryId,
-                    $this->textQuery,
-                    $this->languageCode,
-                    $this->typeBusinessId,
-                    $this->languageId,
-                    $this->iteration,
-                    $this->retry + 1,
-                    $this->nextPageParams
-                )
-                    ->delay(now()->addSeconds(rand(3, 8)))
-                    ->onQueue('search');
-
-                return;
-            }
-
-            $logger->write("[ПРОВАЛ] итерация={$this->iteration} попытки исчерпаны", 'search.log');
+            // Логируем диагностику каждой failed-попытки и перебрасываем выше —
+            // Laravel сам сделает retry через backoff() и failed_jobs / failed().
+            $this->logger->writeFile("[ОШИБКА] {$e->getMessage()} попытка={$this->attempts()}", 'search.log');
+            throw $e;
         }
+    }
+
+    /**
+     * Расписание задержек между retry-попытками. Возвращает массив:
+     * [N сек после 1-го фейла, M сек после 2-го фейла, ...].
+     */
+    public function backoff(): array
+    {
+        return self::RETRY_BACKOFF_SCHEDULE;
+    }
+
+    /**
+     * Вызывается Laravel'ом, когда все $tries попыток исчерпаны.
+     *
+     * Пишет финальный [ПРОВАЛ]-лог с iteration и причиной. Сам job уже
+     * лежит в failed_jobs — его видно в Horizon. ParsingState содержит
+     * cursor с предыдущей успешной итерации (last scheduleNextIteration),
+     * поэтому повторный makeQuery возобновит парсинг ровно с той страницы,
+     * которая была отправлена этой упавшей попытке.
+     */
+    public function failed(\Throwable $e): void
+    {
+        app(AppLogger::class)->writeFile(
+            "[ПРОВАЛ] итерация={$this->input->iteration} попытки исчерпаны: {$e->getMessage()}",
+            'search.log'
+        );
     }
 
     /**
@@ -207,23 +171,21 @@ class SearchJob implements ShouldQueue
      * Сам HTTP-запрос идёт через Playwright (headless-браузер),
      * чтобы пройти JS-проверки DDG и не словить captcha.
      */
-    private function fetchSerpHtml(PlaywrightService $playwright, AppLogger $logger): string
+    private function fetchSerpHtml(PlaywrightService $playwright): string
     {
-        // mode выбираем заранее, чтобы то же значение использовать и в логе ошибки
-        $mode = ($this->iteration === 0 || $this->nextPageParams === null) ? 'search' : 'nextPage';
+        $isNextPage = $this->input->nextPageParams !== null;
 
         try {
-            if ($mode === 'search') {
-                // первая страница выдачи — обычный поиск по строке запроса
-                return $playwright->search($this->textQuery, $this->languageCode);
+            if ($isNextPage) {
+                // следующая страница — переиспользуем форму Next предыдущей итерации
+                return $playwright->nextPage($this->input->nextPageParams, $this->input->languageCode);
             }
 
-            // следующая страница — переиспользуем форму Next предыдущей итерации
-            $sParam = $this->nextPageParams['s'] ?? '?';
-            return $playwright->nextPage($this->nextPageParams, $this->languageCode);
+            // первая страница выдачи — обычный поиск по строке запроса
+            return $playwright->search($this->input->textQuery, $this->input->languageCode);
         }
         catch (\Throwable $e) {
-            $this->logPlaywrightError($logger, $mode, $e);
+            $this->logPlaywrightError($isNextPage ? 'nextPage' : 'search', $e);
             // прокидываем дальше — handle() поймает и сделает retry по своей логике
             throw $e;
         }
@@ -239,16 +201,16 @@ class SearchJob implements ShouldQueue
      *   - что произошло (класс исключения, сообщение, файл и строка, stack trace)
      *   - параметры пагинации, если упал nextPage (для воспроизведения)
      */
-    private function logPlaywrightError(AppLogger $logger, string $mode, \Throwable $e): void
+    private function logPlaywrightError(string $mode, \Throwable $e): void
     {
         $payload = [
             'event'         => 'playwright_failure',
             'mode'          => $mode,
-            'searchQueryId'    => $this->searchQueryId,
-            'textQuery'     => $this->textQuery,
-            'iteration'     => $this->iteration,
-            'retry'         => $this->retry,
-            'nextPageParams' => $this->nextPageParams,
+            'searchQueryId'    => $this->input->searchQueryId,
+            'textQuery'     => $this->input->textQuery,
+            'iteration'     => $this->input->iteration,
+            'attempt'       => $this->attempts(),
+            'nextPageParams' => $this->input->nextPageParams,
             'exception' => [
                 'class'   => get_class($e),
                 'message' => $e->getMessage(),
@@ -258,51 +220,107 @@ class SearchJob implements ShouldQueue
             'trace' => $e->getTraceAsString(),
         ];
 
-        $logger->write($payload, 'playwright_errors.log');
+        $this->logger->writeFile($payload, 'playwright_errors.log');
     }
 
     /**
-     * Записать в ParsingState cursor текущей страницы выдачи.
+     * Поставить SearchJob в очередь search со случайной задержкой rand($minDelay, $maxDelay) секунд.
      *
-     * Вызывается в самом начале handle() — до fetch'а DDG. Тем самым,
-     * если упадём где угодно ниже, в БД останется ровно тот указатель
-     * (next_page_params), который привёл к этой странице, и resume
-     * стартует именно с неё, а не с нуля.
-     *
-     * Если languageId не задан (старые job'ы из очереди без поля),
-     * тихо пропускаем — нечем индексировать ParsingState.
+     * Используется при retry-перепланировании после сбоя итерации и при переходе
+     * к следующей странице SERP. Случайный jitter в задержке нужен, чтобы не
+     * долбить DDG плотным предсказуемым потоком и не словить блокировку.
      */
-    private function saveCursor(): void
+    private function dispatchAfter(SearchJobInput $input, int $minDelay, int $maxDelay): void
     {
-        if ($this->languageId === null || $this->typeBusinessId === null) {
-            return;
-        }
+        self::dispatch($input)
+            ->delay(now()->addSeconds(rand($minDelay, $maxDelay)))
+            ->onQueue('search');
+    }
 
-        ParsingState::where('language_id', $this->languageId)
-            ->where('type_business_id', $this->typeBusinessId)
-            ->update(['next_page_params' => $this->nextPageParams]);
+    /**
+     * Поставить пачку CrawlJob в очередь crawl одним bulk-push'ем.
+     *
+     * Зачем: при цикле `CrawlJob::dispatch(...)->onQueue('crawl')` каждый URL
+     * порождает отдельный round-trip к очереди (для Redis это N * LPUSH,
+     * для DB-driver'а — N отдельных INSERT'ов). Queue::bulk укладывает все
+     * job'ы за один pipeline / один batch-INSERT.
+     *
+     * @param  string[]  $urls  Уже qualified URL — каждый превратится в один CrawlJob.
+     * @return int              Количество поставленных задач.
+     */
+    private function dispatchCrawlJobs(array $urls): int
+    {
+        $jobs = array_map(
+            fn (string $url) => new CrawlJob($url, $this->input->searchQueryId, $this->input->typeBusinessId),
+            $urls
+        );
+
+        Queue::bulk($jobs, '', 'crawl');
+
+        $this->logger->writeFile(
+            '→ crawl (' . count($jobs) . ') ' . implode(', ', $urls),
+            'search.log'
+        );
+
+        return count($jobs);
     }
 
     /**
      * Пометить парсинг этого сета как завершённый (completion_status = 1).
      *
-     * Вызывается, когда extractNextPageParams вернул null — это значит,
-     * формы Next в SERP больше нет и мы дошли до конца выдачи.
+     * Вызывается, когда SerpParser::extractNextPageParams вернул null —
+     * это значит, формы Next в SERP больше нет и мы дошли до конца выдачи.
      * После этого повторный makeQuery вернёт «Этот парсинг завершен»
      * и не запустит ничего лишнего.
      */
     private function markCompleted(): void
     {
-        if ($this->languageId === null || $this->typeBusinessId === null) {
+        $this->updateState([
+            'completion_status' => 1,
+            'next_page_params'  => null,
+        ]);
+    }
+
+    /**
+     * Сохранить копию HTML SERP-страницы в storage/logs для отладки.
+     *
+     * Зовётся когда фактически парсер не нашёл ни одной ссылки или формы Next:
+     * пользователь сможет открыть файл и посмотреть, что DDG реально вернул
+     * (anomaly-страница / другая разметка / пустая выдача / captcha).
+     */
+    private function dumpEmptyPageHtml(string $html): void
+    {
+        $filename = 'serp_dump_' . date('Ymd_His') . '_iter' . $this->input->iteration . '.html';
+        $path = storage_path('logs/' . $filename);
+        @file_put_contents($path, $html);
+        $this->logger->writeFile("[dump] HTML сохранён: {$filename}", 'search.log');
+    }
+
+    /**
+     * Создать или обновить запись ParsingState для текущего сета
+     * (language_id + type_business_id) указанным набором полей.
+     *
+     * Используется в scheduleNextIteration (cursor на следующую необработанную
+     * страницу) и в markCompleted (status=1). Через updateOrCreate, чтобы
+     * запись создавалась автоматически на первой же scheduleNextIteration —
+     * не нужно делать явный $state->save() в QueryController.
+     *
+     * Если languageId или typeBusinessId не заданы — тихо пропускаем:
+     * нечем индексировать запись.
+     */
+    private function updateState(array $fields): void
+    {
+        if ($this->input->languageId === null || $this->input->typeBusinessId === null) {
             return;
         }
 
-        ParsingState::where('language_id', $this->languageId)
-            ->where('type_business_id', $this->typeBusinessId)
-            ->update([
-                'completion_status' => 1,
-                'next_page_params' => null,
-            ]);
+        ParsingState::updateOrCreate(
+            [
+                'language_id'      => $this->input->languageId,
+                'type_business_id' => $this->input->typeBusinessId,
+            ],
+            $fields
+        );
     }
 
     /**
@@ -315,33 +333,36 @@ class SearchJob implements ShouldQueue
      *     пагинации, retry сбрасывается в 0, очередь search, задержка 2–5 сек
      *     (чтобы не долбить DDG плотным потоком).
      */
-    private function scheduleNextIteration(string $html, AppLogger $logger): void
+    private function scheduleNextIteration(string $html, SerpParser $serpParser): void
     {
-        $nextPageParams = $this->extractNextPageParams($html);
+        $nextPageParams = $serpParser->extractNextPageParams($html);
 
         if ($nextPageParams === null) {
-            $logger->write("[следующая-страница] не найдена — последняя страница выдачи, СТОП", 'search.log');
+            // Диагностика: почему extractNextPageParams вернул null.
+            //   - Если в HTML вообще нет nav-link — это либо anomaly-страница DDG,
+            //     либо настоящий конец выдачи (DDG не показывает форму Next).
+            //   - Если nav-link есть, но parser его не понял — значит DDG
+            //     поменял разметку, нужен фикс SerpParser.
+            $hasNavLink = str_contains($html, 'nav-link') ? 'есть' : 'НЕТ';
+            $hasResultA = str_contains($html, 'result__a') ? 'есть' : 'НЕТ';
+            $this->logger->writeFile(
+                "[done] последняя страница выдачи — парсинг завершён (nav-link={$hasNavLink}, result__a={$hasResultA})",
+                'search.log'
+            );
+            $this->dumpEmptyPageHtml($html);
             $this->markCompleted();
             return;
         }
 
-        $logger->write(
-            "[следующая-страница] найдена s={$nextPageParams['s']} ключи=" . implode(',', array_keys($nextPageParams)),
-            'search.log'
-        );
+        // Сохранить cursor "следующая необработанная страница" в БД ДО dispatch.
+        // Тогда при /makeQuery следующий resume стартует именно с неё, без повтора
+        // только что обработанной. Если упадём после save но до dispatch —
+        // максимум потеряем одно scheduling, но cursor корректный.
+        $this->updateState(['next_page_params' => $nextPageParams]);
 
-        self::dispatch(
-            $this->searchQueryId,
-            $this->textQuery,
-            $this->languageCode,
-            $this->typeBusinessId,
-            $this->languageId,
-            $this->iteration + 1,
-            0,
-            $nextPageParams
-        )
-            ->delay(now()->addSeconds(rand(2, 5)))
-            ->onQueue('search');
+        $this->logger->writeFile("[next] s={$nextPageParams['s']}", 'search.log');
+
+        $this->dispatchAfter($this->input->next($nextPageParams), ...self::NEXT_ITER_DELAY);
     }
 
     /**
@@ -353,25 +374,33 @@ class SearchJob implements ShouldQueue
      * Каждый шаг логирует свой счётчик в search.log, чтобы в логе было видно,
      * на каком этапе сколько ссылок отвалилось.
      */
-    private function extractAndDedupe(string $html, AppLogger $logger): array
+    private function extractAndDedupe(string $html, SerpParser $serpParser): array
     {
-        // 0. достаём сырые ссылки из HTML выдачи DuckDuckGo
-        $rawLinks = $this->extractLinksSERP($html);
-        $logger->write('[сырые] количество=' . count($rawLinks), 'search.log');
+        $rawLinks = $serpParser->extractLinks($html);
+        $rawCount = count($rawLinks);
 
-        // выдача пустая — дальше делать нечего
-        if (empty($rawLinks)) {
+        if ($rawCount === 0) {
+            $this->logger->writeFile('[pipeline] raw=0 — DDG не вернул ни одной ссылки в выдаче', 'search.log');
             return [];
         }
 
-        // 1. приводим каждый URL к scheme://host (убираем path/query/fragment)
-        $normalized = $this->normalizeBatch($rawLinks, $logger);
-        // 2. схлопываем дубли url внутри текущей пачки
-        $unique     = $this->dedupeInBatch($normalized, $logger);
-        // 3. отсекаем мусорные домены/пути (магазины, оборудование, агрегаторы)
-        $afterTrash = $this->filterTrash($unique, $logger);
-        // 4. отсеиваем то, что уже сохранено в БД, и возвращаем только новые URL
-        return $this->dedupeAgainstDb($afterTrash, $logger);
+        // 1. URL → scheme://host (без path/query/fragment).
+        // 2. dedupe внутри текущей SERP-страницы.
+        // 3. trash-фильтр (агрегаторы / магазины / оборудование).
+        // 4. dedupe относительно companies — оставляем только новые.
+        $normalized = $this->normalizeBatch($rawLinks);
+        $unique     = $this->dedupeInBatch($normalized);
+        $afterTrash = $this->filterTrash($unique);
+        $newLinks   = $this->dedupeAgainstDb($afterTrash);
+
+        $this->logger->writeFile(
+            "[pipeline] raw={$rawCount} unique=" . count($unique)
+            . ' after-trash=' . count($afterTrash)
+            . ' new=' . count($newLinks),
+            'search.log'
+        );
+
+        return $newLinks;
     }
 
     /**
@@ -383,16 +412,12 @@ class SearchJob implements ShouldQueue
      * www оставляем как есть — иногда www.site.de и site.de реально разные
      * (отдельные SSL/redirect, разные сайты).
      */
-    private function normalizeBatch(array $rawLinks, AppLogger $logger): array
+    private function normalizeBatch(array $rawLinks): array
     {
-        $normalized = array_values(array_filter(array_map(
+        return array_values(array_filter(array_map(
             fn($url) => $this->normalizeUrl($url),
             $rawLinks
         )));
-
-        $logger->write('[нормализовано] количество=' . count($normalized), 'search.log');
-
-        return $normalized;
     }
 
     /**
@@ -400,14 +425,9 @@ class SearchJob implements ShouldQueue
      *
      * После нормализации схлопываются варианты impressum/kontakt/root одного домена.
      */
-    private function dedupeInBatch(array $normalized, AppLogger $logger): array
+    private function dedupeInBatch(array $normalized): array
     {
-        $unique = array_values(array_unique($normalized));
-        $merged = count($normalized) - count($unique);
-
-        $logger->write('[уникальные-в-пачке] количество=' . count($unique) . " схлопнуто={$merged}", 'search.log');
-
-        return $unique;
+        return array_values(array_unique($normalized));
     }
 
     /**
@@ -416,7 +436,7 @@ class SearchJob implements ShouldQueue
      * Сами правила см. в isTrashUrl(). В лог отдельно пишется список отброшенных,
      * чтобы было видно, какие домены отсеялись.
      */
-    private function filterTrash(array $links, AppLogger $logger): array
+    private function filterTrash(array $links): array
     {
         $clean = [];
         $trashed = [];
@@ -430,12 +450,11 @@ class SearchJob implements ShouldQueue
         }
 
         if ($trashed) {
-            $logger->write(
-                '[trashed] count=' . count($trashed) . ' list=' . json_encode($trashed, JSON_UNESCAPED_SLASHES),
+            $this->logger->writeFile(
+                '[trash] (' . count($trashed) . ') ' . implode(', ', $trashed),
                 'search.log'
             );
         }
-        $logger->write('[after-trash] count=' . count($clean), 'search.log');
 
         return $clean;
     }
@@ -446,10 +465,9 @@ class SearchJob implements ShouldQueue
      * Один SELECT WHERE IN на всю пачку — не N запросов по одному.
      * Дубликаты тоже логируются списком — для разбора, что приходит повторно.
      */
-    private function dedupeAgainstDb(array $links, AppLogger $logger): array
+    private function dedupeAgainstDb(array $links): array
     {
         if (empty($links)) {
-            $logger->write('[new-unique] count=0', 'search.log');
             return [];
         }
 
@@ -467,12 +485,11 @@ class SearchJob implements ShouldQueue
         }
 
         if ($duplicates) {
-            $logger->write(
-                '[db-duplicates] count=' . count($duplicates) . ' list=' . json_encode($duplicates, JSON_UNESCAPED_SLASHES),
+            $this->logger->writeFile(
+                '[db-dup] (' . count($duplicates) . ') ' . implode(', ', $duplicates),
                 'search.log'
             );
         }
-        $logger->write('[new-unique] count=' . count($newLinks), 'search.log');
 
         return $newLinks;
     }
@@ -488,17 +505,17 @@ class SearchJob implements ShouldQueue
      * В лог пишем сводку по tier'ам и список отброшенных, чтобы было видно,
      * какие домены отсекаются на этом этапе.
      */
-    private function filterByClassifier(array $links, LeadClassifier $classifier, AppLogger $logger): array
+    private function filterByClassifier(array $links, LeadClassifier $classifier): array
     {
         $qualified = [];
         $dropped = [];
         $tierStats = [0 => 0, 1 => 0, 2 => 0, 3 => 0];
 
         foreach ($links as $link) {
-            $tier = $classifier->classify($link, null, $this->typeBusinessId);
+            $tier = $classifier->classify($link, null, $this->input->typeBusinessId);
             $tierStats[$tier]++;
 
-            if ($tier === 0) {
+            if (!$classifier->passesUrlFilter($tier)) {
                 $dropped[] = $link;
                 continue;
             }
@@ -506,16 +523,16 @@ class SearchJob implements ShouldQueue
         }
 
         if ($dropped) {
-            $logger->write(
-                '[classifier-dropped] count=' . count($dropped) . ' list=' . json_encode($dropped, JSON_UNESCAPED_SLASHES),
+            $this->logger->writeFile(
+                '[classifier-drop] (' . count($dropped) . ') ' . implode(', ', $dropped),
                 'search.log'
             );
         }
-        $logger->write(
-            '[classifier-stats] t0=' . $tierStats[0] . ' t1=' . $tierStats[1] . ' t2=' . $tierStats[2] . ' t3=' . $tierStats[3],
+        $this->logger->writeFile(
+            '[classifier] t0=' . $tierStats[0] . ' t1=' . $tierStats[1] . ' t2=' . $tierStats[2] . ' t3=' . $tierStats[3]
+            . ' → qualified=' . count($qualified),
             'search.log'
         );
-        $logger->write('[qualified] count=' . count($qualified), 'search.log');
 
         return $qualified;
     }
@@ -548,139 +565,58 @@ class SearchJob implements ShouldQueue
         $scheme = $parts['scheme'] ?? 'https';
         $host = rtrim(strtolower($parts['host']), '.');
 
+        // IDN-домены (Umlaut и кириллица) → punycode-форма (xn--...).
+        // Без этого Guzzle/cURL не может разрешить DNS, и fetchHomepage
+        // получает пустой ответ → "EMPTY HTML" в crawl.log.
+        // Требует PHP-extension intl (libicu); если её нет — оставляем host
+        // как есть, чтобы не падать в окружении без intl.
+        if (function_exists('idn_to_ascii') && preg_match('/[^\x00-\x7f]/', $host)) {
+            $ascii = @idn_to_ascii($host, IDNA_DEFAULT, INTL_IDNA_VARIANT_UTS46);
+            if ($ascii !== false) {
+                $host = $ascii;
+            }
+        }
+
         return $scheme . '://' . $host;
     }
 
     /**
-     * Извлечение ссылок из SERP DuckDuckGo HTML.
-     */
-    private function extractLinksSERP(string $html): array
-    {
-        $links = [];
-
-        preg_match_all(
-            '/class="result__a"[^>]*href="([^"]+)"/i',
-            $html,
-            $matches
-        );
-
-        foreach ($matches[1] as $href) {
-            $href = html_entity_decode($href);
-
-            if (preg_match('/uddg=([^&]+)/', $href, $m)) {
-                $url = urldecode($m[1]);
-                $links[] = strtok($url, '?');
-            } elseif (str_starts_with($href, 'http')) {
-                $links[] = strtok($href, '?');
-            }
-        }
-
-        return $links;
-    }
-
-    /**
-     * Извлечение всех hidden-полей формы Next из конца страницы DDG.
-     * DDG /html/ оборачивает кнопку "Next" в <div class="nav-link"> с form внутри.
-     * Если страниц больше нет — формы нет → возвращаем null.
-     */
-    private function extractNextPageParams(string $html): ?array
-    {
-        if (!preg_match_all('/<div\s+class="nav-link"[^>]*>(.*?)<\/div>/s', $html, $blocks)) {
-            return null;
-        }
-
-        // Если nav-link несколько (Previous + Next) — берём последний (это всегда Next).
-        $section = end($blocks[1]);
-
-        preg_match_all(
-            '/<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"/i',
-            $section,
-            $inputs,
-            PREG_SET_ORDER
-        );
-
-        if (empty($inputs)) {
-            return null;
-        }
-
-        $params = [];
-        foreach ($inputs as $input) {
-            $params[$input[1]] = html_entity_decode($input[2]);
-        }
-
-        // Защита: настоящая форма Next имеет хотя бы q + s.
-        if (!isset($params['q']) || !isset($params['s'])) {
-            return null;
-        }
-
-        return $params;
-    }
-
-    /**
-     * Фильтр URL по 6 категориям мусора. Цель — оставить только производителей мяса
-     * (HACCP-релевантных), отрезав магазины оборудования, агрегаторы, документы, регуляторы.
+     * Скомпилированный regex отбрасывания URL.
      *
-     * ВАЖНО: /produkte/ и /products/ НЕ фильтруются — у настоящих производителей это
-     * страница ассортимента продукции (колбасы, ветчины, копчёности), это нам нужно.
+     * Кэшируется на уровне класса (static) — собирается один раз на воркер,
+     * между всеми job'ами в этом процессе переиспользуется. Lazy-init
+     * происходит в trashUrlPattern() при первом обращении.
+     */
+    private static ?string $compiledTrashPattern = null;
+
+    /**
+     * Фильтр URL по группам "мусорных" паттернов из config/site/trash_url.php.
+     * Цель — оставить только реальных производителей, отрезав магазины,
+     * оборудование, агрегаторы, документы и ассоциации.
+     *
+     * ВАЖНО: /produkte/ и /products/ намеренно НЕ входят ни в одну группу —
+     * у настоящих производителей это страница ассортимента, она нам нужна.
      */
     private function isTrashUrl(string $url): bool
     {
-        // 1. Глобальные платформы и job-сайты — заведомо не производители.
-        $globalPlatforms = 'google\.|facebook\.|linkedin\.|youtube\.|amazon\.|wikipedia\.|instagram\.|tiktok\.|'
-            . 'kununu\.|stepstone\.|indeed\.';
+        return (bool) preg_match($this->trashUrlPattern(), $url);
+    }
 
-        // 2. B2B-каталоги, агрегаторы, бизнес-справочники, госстатистика.
-        // Они содержат списки компаний, а не сами производители.
-        $aggregators = 'gelbeseiten\.|wer-liefert-was\.|europages\.|kompass\.com|'
-            . 'wlw\.de|firmenwissen\.de|northdata\.de|branchenbuch|'
-            . 'bizdb\.|vdma-products\.|firmen-|unternehmen-|spherescout\.|'
-            . 'creditreform\.|firmeneintrag|destatis\.|fleischbranche\.|'
-            . 'remax\.|immobilien-|-immobilien\.|wizzair\.';
+    /**
+     * Возвращает скомпилированный regex для isTrashUrl.
+     *
+     * При первом вызове в рамках воркера склеивает группы из config/site/trash_url.php
+     * через "|" и кэширует результат в static-свойстве; последующие вызовы
+     * возвращают готовый pattern без рекомпиляции.
+     */
+    private function trashUrlPattern(): string
+    {
+        if (self::$compiledTrashPattern !== null) {
+            return self::$compiledTrashPattern;
+        }
 
-        // 3. Магазины (домены). Производитель может иметь онлайн-витрину,
-        // но если он назвался "shop" в домене — это розничник, не производитель.
-        // \.shop$ и \.shop/ — TLD .shop (типа torwegge.shop).
-        $shopDomains = '-shop\.|shop-|shop\d+\.|-store\.|store-|-versand\.|-direkt\.|'
-            . '-katalog\.|-mall\.|-onlineshop\.|onlineshop-|'
-            . '\.shop/|\.shop$|\.shop\?|'
-            . '-grosshandel\.|grosshandel-|-grosshandel-';
+        $groups = config('site.trash_url.groups', []);
 
-        // 4. Магазины (пути). Признаки розничной площадки в URL-пути.
-        // /produkte/ и /products/ оставлены за бортом — это легитимные пути производителей.
-        $shopPaths = '/shop/|/store/|/cart/|/warenkorb/|/checkout/|/kaufen/|/bestellen/|'
-            . '/sortiment/|/category/|/categories/|/kategorie/|/kategorien/';
-
-        // 5a. Оборудование и техника — пути. Не производители продуктов, а поставщики машин/деталей.
-        // Это случай "statt-shop.de/.../tumbler/tumbler" из исходного примера.
-        $equipmentPaths = '/maschinen/|/equipment/|/zubehoer/|/ersatzteile/|/anlagen/|'
-            . '/tumbler/|/mischmaschine|/verpackungsmaschine|/fleischwolf|/kutter|'
-            . '/technik/|/technologie/|/teile/';
-
-        // 5b. Оборудование — доменные паттерны (например mayer-maschinen.de).
-        // Это equipment-производители, нам они не нужны — нужны те, кто делает САМО мясо.
-        $equipmentDomains = '-maschinen\.|maschinen-|-anlagen\.|anlagen-|-anlagenbau\.|anlagenbau-|'
-            . '-technik\.|technik-|-geraete\.|-systeme\.|-werkzeug\.|werkzeug-|'
-            . '-edelstahl\.|edelstahl-|-pack\.|pack-|-verpackung\.|verpackung-|'
-            . '-arbeitssicher|arbeitssicher-|asz-gmbh';
-
-        // 6. Документы (PDF/DOC), регуляторы/образование, ассоциации/союзы.
-        // PDF-каталог производителя ценен, но мы не парсим PDF — пусть лежит мимо.
-        // Verband / Verein — это ассоциации (vdf.de, fleischerverband etc), не производители.
-        $docsAndGov = '\.pdf$|\.doc$|\.docx$|\.xls$|\.xlsx$|'
-            . 'wko\.at|bmel\.de|\.gov\.|\.gov$|/regierung|'
-            . 'uni-|hochschule-|tu-berlin|tu-muenchen|tu-dresden|'
-            . '-verband\.|verband-|-verein\.|verein-|v-d-f\.|fleischerverband|industrieverband';
-
-        $pattern = '#(?:'
-            . $globalPlatforms . '|'
-            . $aggregators . '|'
-            . $shopDomains . '|'
-            . $shopPaths . '|'
-            . $equipmentPaths . '|'
-            . $equipmentDomains . '|'
-            . $docsAndGov
-            . ')#i';
-
-        return (bool) preg_match($pattern, $url);
+        return self::$compiledTrashPattern = '#(?:' . implode('|', $groups) . ')#i';
     }
 }
