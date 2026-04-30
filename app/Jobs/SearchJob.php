@@ -3,6 +3,7 @@
 namespace App\Jobs;
 
 use App\Models\Company;
+use App\Models\ParsingState;
 use App\Services\AppLogger;
 use App\Services\LeadClassifier;
 use App\Services\PlaywrightService;
@@ -32,6 +33,12 @@ class SearchJob implements ShouldQueue
     public ?int $typeBusinessId;
 
     /**
+     * id языка (languages.id) — нужен как составной ключ ParsingState
+     * (language_id + type_business_id) для записи прогресса/cursor'а.
+     */
+    public ?int $languageId;
+
+    /**
      * iteration = логическая "страница" — шаг обхода выдачи.
      */
     public int $iteration;
@@ -52,6 +59,7 @@ class SearchJob implements ShouldQueue
         string $textQuery,
         ?string $languageCode = null,
         ?int $typeBusinessId = null,
+        ?int $languageId = null,
         int $iteration = 0,
         int $retry = 0,
         ?array $nextPageParams = null
@@ -60,6 +68,7 @@ class SearchJob implements ShouldQueue
         $this->textQuery = $textQuery;
         $this->languageCode = $languageCode;
         $this->typeBusinessId = $typeBusinessId;
+        $this->languageId = $languageId;
         $this->iteration = $iteration;
         $this->maxIterations = 3;
         $this->retry = $retry;
@@ -78,6 +87,12 @@ class SearchJob implements ShouldQueue
             $logger->write("[СТОП] достигнут лимит итераций", 'search.log');
             return;
         }
+
+        // Зафиксировать cursor ТЕКУЩЕЙ страницы до fetch — чтобы при крахе
+        // в любой точке handle() в БД лежал указатель ровно на ту страницу,
+        // на которой мы упали, и resume точно сюда же вернулся.
+        // На первой итерации nextPageParams=null → запишется null (bare search).
+        $this->saveCursor();
 
         try {
             sleep(rand(1, 2));
@@ -160,6 +175,7 @@ class SearchJob implements ShouldQueue
                     $this->textQuery,
                     $this->languageCode,
                     $this->typeBusinessId,
+                    $this->languageId,
                     $this->iteration,
                     $this->retry + 1,
                     $this->nextPageParams
@@ -246,6 +262,50 @@ class SearchJob implements ShouldQueue
     }
 
     /**
+     * Записать в ParsingState cursor текущей страницы выдачи.
+     *
+     * Вызывается в самом начале handle() — до fetch'а DDG. Тем самым,
+     * если упадём где угодно ниже, в БД останется ровно тот указатель
+     * (next_page_params), который привёл к этой странице, и resume
+     * стартует именно с неё, а не с нуля.
+     *
+     * Если languageId не задан (старые job'ы из очереди без поля),
+     * тихо пропускаем — нечем индексировать ParsingState.
+     */
+    private function saveCursor(): void
+    {
+        if ($this->languageId === null || $this->typeBusinessId === null) {
+            return;
+        }
+
+        ParsingState::where('language_id', $this->languageId)
+            ->where('type_business_id', $this->typeBusinessId)
+            ->update(['next_page_params' => $this->nextPageParams]);
+    }
+
+    /**
+     * Пометить парсинг этого сета как завершённый (completion_status = 1).
+     *
+     * Вызывается, когда extractNextPageParams вернул null — это значит,
+     * формы Next в SERP больше нет и мы дошли до конца выдачи.
+     * После этого повторный makeQuery вернёт «Этот парсинг завершен»
+     * и не запустит ничего лишнего.
+     */
+    private function markCompleted(): void
+    {
+        if ($this->languageId === null || $this->typeBusinessId === null) {
+            return;
+        }
+
+        ParsingState::where('language_id', $this->languageId)
+            ->where('type_business_id', $this->typeBusinessId)
+            ->update([
+                'completion_status' => 1,
+                'next_page_params' => null,
+            ]);
+    }
+
+    /**
      * Планирование следующей итерации обхода выдачи.
      *
      * Что делает:
@@ -261,6 +321,7 @@ class SearchJob implements ShouldQueue
 
         if ($nextPageParams === null) {
             $logger->write("[следующая-страница] не найдена — последняя страница выдачи, СТОП", 'search.log');
+            $this->markCompleted();
             return;
         }
 
@@ -274,6 +335,7 @@ class SearchJob implements ShouldQueue
             $this->textQuery,
             $this->languageCode,
             $this->typeBusinessId,
+            $this->languageId,
             $this->iteration + 1,
             0,
             $nextPageParams
