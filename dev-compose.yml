@@ -38,6 +38,8 @@ services:
     depends_on:
       app:
         condition: service_healthy
+      searxng:
+        condition: service_healthy
     dns:
       - 8.8.8.8
       - 8.8.4.4
@@ -94,6 +96,33 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    restart: unless-stopped
+    expose:
+      - "8080"
+    volumes:
+      - ./docker/searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://searxng:8080/
+      - INSTANCE_NAME=parser-haccp
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   phpmyadmin:
     image: phpmyadmin:latest

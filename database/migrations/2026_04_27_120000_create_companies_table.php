@@ -19,6 +19,7 @@ return new class extends Migration
             $table->foreignId('search_query_id')->nullable()->constrained('search_query');
             $table->boolean('raw_checked')->default(1);
             $table->timestamps();
+            $table->softDeletes();
         });
     }
 

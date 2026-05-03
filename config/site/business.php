@@ -129,71 +129,162 @@ return [
         2 => [
 
             /*
-            |--------------------------------------------------------------------------
-            | URL SCORING (кто они по домену)
-            |--------------------------------------------------------------------------
+[
+    'Molkerei Impressum Kontakt Deutschland',
+    'Milchverarbeitung Impressum Kontakt Deutschland',
+    'Käserei Impressum Kontakt Deutschland',
+    'Milchproduktion Impressum Kontakt Deutschland',
+    'Sennerei Impressum Kontakt Deutschland',
+]
             */
 
             'url' => [
 
                 'positive' => [
 
-                    // +5 — прямые производители молока / молочной продукции
+                    /*
+                    |--------------------------------------------------------------------------
+                    | +5 — ЯВНЫЕ МОЛОЧНЫЕ ПРОИЗВОДИТЕЛИ
+                    |--------------------------------------------------------------------------
+                    |
+                    | Самые сильные сигналы:
+                    | молокозаводы, сыроварни, dairy-производители,
+                    | переработчики молока.
+                    |
+                    */
+
                     5 => [
-                        'milchhof',
                         'molkerei',
+                        'milchhof',
+                        'milchwerk',
                         'dairy',
                         'kaeserei',
                         'sennerei',
                         'butterei',
+                        'milchverarbeitung',
+                        'milchproduktion',
+                        'kaeseproduktion',
+                        'kaeseherstellung',
                     ],
 
-                    // +3 — переработка / производство
+                    /*
+                    |--------------------------------------------------------------------------
+                    | +3 — МОЛОЧНАЯ ПРОДУКЦИЯ / ПРОИЗВОДСТВО
+                    |--------------------------------------------------------------------------
+                    */
+
                     3 => [
                         'milch',
                         'kaese',
                         'joghurt',
                         'quark',
+                        'butter',
+                        'sahne',
+                        'molke',
+                        'frischkaese',
                         'verarbeitung',
                         'produktion',
+                        'herstellung',
                         'manufaktur',
+                        'lebensmittelproduktion',
                     ],
 
-                    // +1 — агро / пищевая отрасль (слабый сигнал)
+                    /*
+                    |--------------------------------------------------------------------------
+                    | +1 — СЛАБЫЕ FOOD / AGRO СИГНАЛЫ
+                    |--------------------------------------------------------------------------
+                    */
+
                     1 => [
                         'landwirtschaft',
                         'agrar',
                         'lebensmittel',
                         'food',
+                        'bio',
+                        'regional',
                     ],
                 ],
 
                 'negative' => [
 
-                    // -5 — не производство
+                    /*
+                    |--------------------------------------------------------------------------
+                    | -5 — ОБОРУДОВАНИЕ / НЕ FOOD ПРОИЗВОДСТВО
+                    |--------------------------------------------------------------------------
+                    */
+
                     5 => [
                         'maschinen',
                         'anlagenbau',
                         'industrie',
-                        'grosshandel',
                         'technik',
+                        'edelstahl',
+                        'verpackung',
+                        'automation',
+                        'engineering',
+                        'systemtechnik',
+                        'foerdertechnik',
                     ],
 
-                    // -3 — коммерция / логистика / e-commerce
-                    3 => [
-                        'shop',
-                        'online',
-                        'logistik',
-                        'spedition',
-                        'liefer',
-                    ],
+                    /*
+                    |--------------------------------------------------------------------------
+                    | -4 — АССОЦИАЦИИ / СЕРВИС / НЕРЕЛЕВАНТ
+                    |--------------------------------------------------------------------------
+                    */
 
-                    // -4 — организации / ассоциации / нерелевант
                     4 => [
                         'verband',
                         'verein',
-                        'immobilien',
                         'beratung',
+                        'consulting',
+                        'immobilien',
+                        'versicherung',
+                        'steuerberater',
+                        'rechtsanwalt',
+                        'logistikzentrum',
+                    ],
+
+                    /*
+                    |--------------------------------------------------------------------------
+                    | -3 — RETAIL / E-COMMERCE / HORECA
+                    |--------------------------------------------------------------------------
+                    */
+
+                    3 => [
+                        'shop',
+                        'online',
+                        'store',
+                        'markt',
+                        'lieferservice',
+                        'liefer',
+                        'spedition',
+                        'logistik',
+                        'cafe',
+                        'restaurant',
+                        'eiscafe',
+                        'hofladen',
+                        'farmshop',
+                        'biohof',
+                        'hotel',
+                    ],
+
+                    /*
+                    |--------------------------------------------------------------------------
+                    | -2 — СЛАБЫЕ D2C / RETAIL СИГНАЛЫ
+                    |--------------------------------------------------------------------------
+                    |
+                    | Не полный мусор, но чаще всего small local retail,
+                    | а не HACCP/BRC производители.
+                    |
+                    */
+
+                    2 => [
+                        'baeckerei',
+                        'konditorei',
+                        'feinkost',
+                        'genuss',
+                        'event',
+                        'catering',
                     ],
                 ],
             ],

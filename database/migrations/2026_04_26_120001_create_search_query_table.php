@@ -17,6 +17,10 @@ return new class extends Migration
                 ->constrained('type_business')
                 ->cascadeOnDelete();
             $table->string('text');
+            // Флаг завершения парсинга: 0 — не запускался / в процессе,
+            // 1 — SearchJob прошёл все страницы и завершился без ошибок.
+            // Выставляется в SearchJob::handle() в самом конце успешного прогона.
+            $table->boolean('completion_status')->default(0);
             $table->timestamps();
         });
     }

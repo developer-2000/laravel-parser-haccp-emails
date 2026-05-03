@@ -1,0 +1,24 @@
+# Минимальный конфиг SearXNG: только Google как источник.
+# DDG/Brave/StartPage блокируют наш datacenter-IP (CAPTCHA / 429),
+# а Bing/Mojeek/Qwant дают мусорную выдачу с фуззи-матчингом.
+# Тест показал что Google единственный реально работает на DACH-нише
+# и держит релевантность как минимум до page 10.
+#
+# ВАЖНО: НЕ добавлять другие engines без явного запроса пользователя.
+
+use_default_settings:
+  engines:
+    keep_only:
+      - google
+
+server:
+  secret_key: "parser-haccp-local-only"
+
+search:
+  formats:
+    - html
+    - json
+
+engines:
+  - name: google
+    timeout: 12.0

@@ -170,7 +170,17 @@ class CrawlJob implements ShouldQueue
 
         [$emails, $phones] = $this->collectContacts($html);
 
-        $this->persistCompany($title, $tier, $emails, $phones);
+        // Имя компании: приоритет — copyright-строка футера (там обычно чистый
+        // brand). Если не найдена — fallback на <title> (он же используется
+        // выше для off-topic-фильтра). Логируем NAME только когда оно отличается
+        // от title — чтобы не плодить шум в логе для большинства сайтов.
+        $nameFromFooter = $this->extractCompanyNameFromFooter($html);
+        $companyName = $nameFromFooter ?? $title;
+        if ($nameFromFooter !== null && $nameFromFooter !== $title) {
+            $this->log("  NAME: '{$nameFromFooter}' (from footer ©)");
+        }
+
+        $this->persistCompany($companyName, $tier, $emails, $phones);
 
         $duration = round(microtime(true) - $startedAt, 2);
         $this->log("===== CrawlJob END: {$this->url} (took {$duration}s) =====");
@@ -256,11 +266,21 @@ class CrawlJob implements ShouldQueue
         $emails = $this->filterEmails(array_values(array_unique(array_filter($emails))));
         $phones = array_values(array_unique(array_filter($phones)));
 
+        // Колонка companies.name — varchar(255) (Laravel string-default).
+        // Часть сайтов отдаёт длинные SEO-title (бывает 250+ символов с
+        // повторами через " | "), которые ломают INSERT с MySQL strict-mode:
+        // "Data too long for column 'name'". Обрезаем по графемам через
+        // mb_substr (UTF-8) с запасом до 250 — Umlaut'ы в utf8mb4 могут
+        // занимать 2-3 байта, и 255 байт ≠ 255 символов.
+        $safeName = $companyName === null
+            ? null
+            : mb_substr($companyName, 0, 250, 'UTF-8');
+
         $existed = Company::where('url', $this->url)->exists();
         Company::updateOrCreate(
             ['url' => $this->url],
             [
-                'name'            => $companyName,
+                'name'            => $safeName,
                 'emails'          => $emails,
                 'phones'          => $phones,
                 'tier'            => $tier,
@@ -293,10 +313,17 @@ class CrawlJob implements ShouldQueue
             // с маленьким body, который extract'ы возвращают пустыми, и мы
             // двигаемся дальше. Включение retry(...) добавляло 1.5-3 сек
             // на каждом таком path и растягивало обход на минуты.
+            // User-Agent и Accept-Language имитируют реальный Chrome на Windows.
+            // Голый "Mozilla/5.0" триггерит anti-bot эвристики на части сайтов
+            // (особенно за Cloudflare). Полный UA не пробивает CF JS-challenge,
+            // но снимает ложные блокировки на менее агрессивных защитах.
             $response = Http::timeout(self::FETCH_TIMEOUT)
                 ->withHeaders([
-                    'User-Agent' => 'Mozilla/5.0',
-                    'Accept' => 'text/html',
+                    'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                        . 'AppleWebKit/537.36 (KHTML, like Gecko) '
+                        . 'Chrome/120.0.0.0 Safari/537.36',
+                    'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language' => 'de-DE,de;q=0.9,en;q=0.8',
                 ])
                 ->get($url);
 
@@ -331,7 +358,7 @@ class CrawlJob implements ShouldQueue
 
     /**
      * STEP B:
-     * извлечение email — 6 проходов:
+     * извлечение email — 7 проходов:
      *   1. Прямой regex по сырому HTML (для незашитых email).
      *   2. После нормализации обфускаций (∂ / [at] / (at) / &#64; / &commat; → @,
      *      удаление <span>...</span> и других тегов между частями адреса).
@@ -344,6 +371,10 @@ class CrawlJob implements ShouldQueue
      *      обычный regex такие пропускает.
      *   6. JS-конкатенация ("info" + "@" + "company.de") — частая обфускация
      *      от ботов, обычный regex её не видит.
+     *   7. HTML numeric entities: вся последовательность букв email закодирована
+     *      смесью decimal `&#105;` и hex `&#x6E;` сущностей (типичный WordPress
+     *      Email-Address-Encoder). Декодируем html_entity_decode и прогоняем
+     *      базовый regex по уже читаемому тексту.
      *
      * Ограничения базового regex:
      *   - TLD длиной 2..6 — чтобы не захватить "deUmsatzsteuer..." после .de.
@@ -358,6 +389,7 @@ class CrawlJob implements ShouldQueue
             $this->decodeCfEmails($html),
             $this->extractMailtoEmails($html),
             $this->extractJsConcatEmails($html),
+            $this->extractHtmlEntityEmails($html),
         ));
     }
 
@@ -432,10 +464,17 @@ class CrawlJob implements ShouldQueue
 
     /**
      * Финальная очистка кандидатов внутри extractEmails:
+     *   - rawurldecode — декодирует %20 / %40 / %2E которые приходят из
+     *     href-атрибутов и захватываются extractDirect'ом как мусор
+     *     (`mailto: info@...` → href `mailto:%20info@...` → regex ловит
+     *     `%20info@...` целиком как email). Используем именно raw-вариант,
+     *     чтобы НЕ ломать plus-addressing (john+test@example.com).
      *   - нормализация (strtolower + trim) — чтобы INFO@SITE.DE и info@site.de
      *     схлопывались на этапе array_unique;
-     *   - отсев псевдо-email из имён файлов (logo@2x.png, font@2x.woff2),
-     *     раньше эта проверка стояла в filterEmails;
+     *   - re-validation EMAIL_REGEX_ANCHORED — после rawurldecode форма могла
+     *     стать невалидной (например ",info@..." с ведущей запятой); такие
+     *     отбрасываем;
+     *   - отсев псевдо-email из имён файлов (logo@2x.png, font@2x.woff2);
      *   - отсев пустых строк.
      *
      * Шаблонные имена и tracking-домены здесь НЕ отсекаем — это финальная
@@ -447,8 +486,11 @@ class CrawlJob implements ShouldQueue
 
         $clean = [];
         foreach ($emails as $email) {
-            $email = strtolower(trim($email));
+            $email = strtolower(trim(rawurldecode($email)));
             if ($email === '' || preg_match($assetExt, $email)) {
+                continue;
+            }
+            if (!preg_match(self::EMAIL_REGEX_ANCHORED, $email)) {
                 continue;
             }
             $clean[] = $email;
@@ -482,6 +524,36 @@ class CrawlJob implements ShouldQueue
         }
 
         return $emails;
+    }
+
+    /**
+     * Проход 7 — декодирование HTML числовых сущностей.
+     *
+     * Ловит email, у которого ВСЯ последовательность символов закодирована как
+     * `&#NNN;` (decimal) или `&#xHH;` (hex), часто вперемешку:
+     *
+     *   &#105;&#x6E;&#102;&#x6F;&#64;&#x6D;&#101;&#x74;&#x67;&#x65;&#x72;&#x65;&#x69;&#x2E;&#x64;&#x65;
+     *
+     * расшифровывается как `info@metzgerei.de`. Это типичная защита WordPress-
+     * плагинов вроде "Email Address Encoder": в исходнике стоит plain email,
+     * а на выходе плагин рендерит каждый символ как сущность. Никакие наши
+     * regex'ы по сырому HTML такое не ловят.
+     *
+     * Решение: html_entity_decode прогоняет ВСЕ entity-формы (decimal/hex/named)
+     * → получаем читаемый текст → стандартный EMAIL_REGEX его матчит.
+     * Раннее str_contains-условие вырезает 95% страниц без сущностей,
+     * чтобы не делать full-decode зря.
+     */
+    private function extractHtmlEntityEmails(string $html): array
+    {
+        if (!str_contains($html, '&#')) {
+            return [];
+        }
+
+        $decoded = html_entity_decode($html, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        preg_match_all(self::EMAIL_REGEX, $decoded, $matches);
+
+        return $matches[0] ?? [];
     }
 
     /**
@@ -690,6 +762,65 @@ class CrawlJob implements ShouldQueue
     }
 
     /**
+     * STEP D2 — приоритетное извлечение имени компании из copyright-блока футера.
+     *
+     * Зачем: <title> часто содержит мусор ("- START -", "Welcome", длинная SEO-фраза
+     * на 250+ символов с повторяющимися ключевиками), а в копирайт-блоке внизу
+     * страницы обычно лежит чистое brand-имя:
+     *   <span>© 2026 Höfle Metzgerei</span>             → "Höfle Metzgerei"
+     *   Copyright © 2024-2026 Acme GmbH | All rights... → "Acme GmbH"
+     *
+     * Алгоритм:
+     *   1. Декодируем HTML-сущности и заменяем теги на \n чтобы соседние
+     *      блоки не склеились в одну строку.
+     *   2. Берём все строки содержащие © (или Copyright).
+     *   3. Для каждой строки убираем сам символ ©, слово Copyright, год/диапазон лет.
+     *   4. Обрезаем хвост на сепараторах (`|`, `•`, `·`, `. `) и стоп-фразах
+     *      ("All rights reserved", "Alle Rechte vorbehalten" и т.п.).
+     *   5. Валидируем длину (2..80 символов) — фильтр от пустых и захвата мусора.
+     *
+     * Возвращает первое валидное имя или null если ни одна строка не подошла.
+     * Caller использует этот результат с fallback'ом на extractTitle().
+     */
+    private function extractCompanyNameFromFooter(string $html): ?string
+    {
+        $text = html_entity_decode($html, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        // Теги → \n: чтобы соседние ячейки/блоки в футере (например <span>©</span>
+        // <span>Höfle</span>) после strip'а пришли разными строками или, наоборот,
+        // соединились через пробел — а не "слиплись" буквально без разделителя.
+        $text = preg_replace('/<[^>]+>/', "\n", $text);
+
+        if (!preg_match_all('/[^\n]*©[^\n]*/u', $text, $lines)) {
+            return null;
+        }
+
+        foreach ($lines[0] as $line) {
+            // Убираем символ © и (c) везде в строке (имя бывает и до, и после ©).
+            $line = preg_replace('/©|\(c\)/iu', ' ', $line);
+            // Убираем слово Copyright (часто стоит рядом с ©).
+            $line = preg_replace('/\bCopyright\b/iu', ' ', $line);
+            // Убираем год или диапазон лет (2024, 2024-2026, 2024 — 2026).
+            $line = preg_replace('/\b\d{4}(?:\s*[-–—]\s*\d{4})?\b/u', ' ', $line);
+
+            // Обрезаем по разделителям/стоп-фразам — берём ТОЛЬКО первую часть.
+            $name = preg_split(
+                '/\s*[|•·]\s*|\.\s+|\s+All\s+rights|\s+Alle\s+Rechte|\s+Tous\s+droits/iu',
+                $line
+            )[0] ?? '';
+
+            // Чистим хвостовые пунктуации/тире/пробелы.
+            $name = trim($name, " \t\n\r\0\x0B-–—.,;:");
+
+            $len = mb_strlen($name);
+            if ($len >= 2 && $len <= 80) {
+                return $name;
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * STEP F:
      * фильтрация мусорных email (финальная сетка).
      *
@@ -879,6 +1010,11 @@ class CrawlJob implements ShouldQueue
             'Statistik', 'Statistical',
             // Captcha / bot-блокировки
             'Human Verification', 'Security Check', 'Robot Check', 'Access Denied',
+            // Cloudflare JS-challenge interstitial (5KB страница "Just a moment..."):
+            // получаем её вместо реального сайта, когда CF бот-эвристика блокирует
+            // datacenter-IP. Реальный HTML без headless-браузера не достать —
+            // дропаем тихо, чтобы не плодить мусор "name: Just a moment..." в БД.
+            'Just a moment',
         ];
 
         $regex = '/' . implode('|', array_map('preg_quote', $patterns)) . '/i';

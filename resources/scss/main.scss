@@ -5,11 +5,16 @@ body {
     font-family: $font-family;
     color: $color-text;
     background: $color-bg;
+    cursor: default;
 }
 
 a {
-    color: inherit;
+    color: $color-blue-700;
     text-decoration: none;
+    transition: color 0.3s;
+    &:hover{
+        color: $color-blue-500;
+    }
 }
 
 .app-wrapper {
@@ -23,4 +28,18 @@ a {
     margin: 0 auto;
     padding: 0 $content-pad;
     box-sizing: border-box;
+}
+
+svg{
+    width: 16px;
+    height: 16px;
+    path{
+        transition: fill 0.3s;
+    }
+}
+
+.n-card__footer{
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
 }

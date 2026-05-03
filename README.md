@@ -27,6 +27,10 @@ docker compose -f dev-compose.yml ps
 docker compose -f dev-compose.yml exec queue php artisan horizon:status
 
 ## После изменений в Job
+# 1. Применить новый settings.yml — searxng читает конфиг только при старте
+docker compose -f dev-compose.yml restart searxng
+# 2. Перезапустить queue-worker — Horizon держит PHP-классы (SearchJob, SearxClient)
+#    в памяти, без рестарта мои правки кода не применятся
 docker compose -f dev-compose.yml restart queue
  - Рестарт Horizon (после деплоя джобов)
 docker compose -f dev-compose.yml exec redis redis-cli FLUSHALL

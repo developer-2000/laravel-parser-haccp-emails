@@ -14,6 +14,11 @@ class SearchQuery extends Model
         'language_id',
         'type_business_id',
         'text',
+        'completion_status',
+    ];
+
+    protected $casts = [
+        'completion_status' => 'boolean',
     ];
 
     /**
