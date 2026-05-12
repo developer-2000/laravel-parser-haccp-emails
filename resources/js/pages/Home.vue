@@ -130,92 +130,17 @@
             />
         </div>
 
-        <!-- Отправить Letter на этот Email -->
-        <n-modal
-            v-model:show="showEmailModal"
-            preset="card"
-            content-scrollable
-            :style="{ width: '600px', height: '400px' }"
-            :segmented="{ content: true, footer: true }"
-        >
-            <template #header>
-                {{ editingEmail }}
-            </template>
+        <!--
+        Отправка письма на email компании.
+        После успешной отправки эмитит 'sent', локально помечаем email как "уже отправленный"
+        -->
+        <EmailLetterModal ref="emailModalRef" @sent="onLetterSent" />
 
-            <div class="email-modal-body">
-                <!-- История писем для этой пары (company_id + email).
-                     По умолчанию все панели свернуты (default-expanded-names не задан).
-                     Заголовок панели — сокращённый превью текста письма,
-                     внутри — полный текст. -->
-                <n-collapse
-                    v-if="letterHistory.length"
-                    class="email-modal-body__history"
-                    accordion
-                >
-                    <n-collapse-item
-                        v-for="item in letterHistory"
-                        :key="item.id"
-                        :name="String(item.id)"
-                        :title="letterPreview(item.letter)"
-                    >
-                        <div class="email-modal-body__letter">{{ item.letter }}</div>
-                    </n-collapse-item>
-                </n-collapse>
-
-                <n-input
-                    v-model:value="editingLetter"
-                    type="textarea"
-                    placeholder="Текст письма"
-                    :autosize="{ minRows: 8 }"
-                />
-            </div>
-
-            <template #footer>
-                <n-button
-                    type="info"
-                    strong
-                    secondary
-                    :loading="emailSending"
-                    :disabled="!editingLetter.trim() || emailSending"
-                    @click="sendEmailLetter"
-                >
-                    Отправить
-                </n-button>
-            </template>
-        </n-modal>
-
-        <!-- Редактирование компании (поле name) -->
-        <n-modal
-            v-model:show="showCompanyModal"
-            preset="card"
-            :style="{ width: '500px' }"
-            :segmented="{ content: true, footer: true }"
-        >
-            <template #header>
-                Редактировать компанию #{{ editingCompanyForName?.id }}
-            </template>
-
-            <n-form-item label="Название" :show-feedback="false">
-                <n-input
-                    v-model:value="editingCompanyName"
-                    placeholder="Название компании"
-                    @keydown.enter="saveCompanyName"
-                />
-            </n-form-item>
-
-            <template #footer>
-                <n-button
-                    type="info"
-                    strong
-                    secondary
-                    :loading="companySaving"
-                    :disabled="!editingCompanyName.trim() || companySaving"
-                    @click="saveCompanyName"
-                >
-                    Сохранить
-                </n-button>
-            </template>
-        </n-modal>
+        <!--
+        Редактирование name компании.
+        После успешного сохранения эмитит 'saved', локально обновляем row.name в таблице.
+        -->
+        <CompanyEditModal ref="companyModalRef" @saved="onCompanySaved" />
 
     </section>
 </template>
@@ -230,6 +155,8 @@ import { NButton, NPopconfirm } from 'naive-ui';
 import apiAxios from '@/utils/apiAxios.js';
 import { notification } from '@/utils/notify.js';
 import { useLanguageStore } from '@/stores/language.js';
+import EmailLetterModal from '@/components/EmailLetterModal.vue';
+import CompanyEditModal from '@/components/CompanyEditModal.vue';
 
 const languageStore = useLanguageStore();
 
@@ -293,52 +220,33 @@ const pagination = reactive({
     },
 });
 
-// Модалка редактирования письма для email компании.
-// editingEmail/editingCompanyId — контекст (какой email какой компании
-// редактируется); editingLetter — текст письма в textarea;
-// emailSending — флаг "идёт сохранение", блокирует кнопку отправки.
-const showEmailModal = ref(false);
-const editingEmail = ref('');
-const editingCompanyId = ref(null);
-const editingLetter = ref('');
-const emailSending = ref(false);
+// Ссылка на модалку отправки письма — открываем через
+// emailModalRef.value.open(companyId, email) из колонки Email.
+const emailModalRef = ref(null);
 
-// История писем для текущей пары (company_id + email) — массив
-// { id, letter, created_at }, в обратном порядке (новые сверху).
-// Подгружается при открытии модалки.
-const letterHistory = ref([]);
+// Ссылка на модалку редактирования компании — открываем через
+// companyModalRef.value.open(companyId, currentName) из action-колонки.
+const companyModalRef = ref(null);
 
-// Модалка редактирования компании (сейчас — только поле name).
-// editingCompanyForName хранит ссылку на саму row в companies — после
-// успешного сохранения мы её мутируем, и таблица сразу перерисовывается.
-const showCompanyModal = ref(false);
-const editingCompanyForName = ref(null);
-const editingCompanyName = ref('');
-const companySaving = ref(false);
-
-// Сокращённый превью текста письма для заголовка гармошки.
-// Берём первую непустую строку, обрезаем до 60 символов с многоточием.
-function letterPreview(letter) {
-    const first = String(letter ?? '').split('\n').find((l) => l.trim()) ?? '';
-    return first.length > 60 ? first.slice(0, 60).trimEnd() + '…' : first;
+// Обработчик успешной отправки письма из EmailLetterModal.
+// Помечаем email компании как "уже отправленный", чтобы рядом с ним
+// появилась иконка sentLetterIconVNode без перезапроса списка.
+function onLetterSent({ companyId, email }) {
+    const row = companies.value.find((c) => c.id === companyId);
+    if (!row) return;
+    const sent = Array.isArray(row.sent_emails) ? row.sent_emails : [];
+    if (!sent.includes(email)) {
+        row.sent_emails = [...sent, email];
+    }
 }
 
-async function openEmailEdit(companyId, email) {
-    editingCompanyId.value = companyId;
-    editingEmail.value = email;
-    editingLetter.value = '';
-    letterHistory.value = [];
-    showEmailModal.value = true;
-
-    // Подгружаем историю писем для гармошки. Ошибки молча проглатываем —
-    // apiAxios сам покажет toast, а пустая история не блокирует ввод нового.
-    const response = await apiAxios.get('/company-emails', {
-        company_id: companyId,
-        email,
-    });
-    if (response?.status === 'success') {
-        letterHistory.value = response?.data?.items ?? [];
-    }
+// Обработчик успешного сохранения name из CompanyEditModal.
+// Обновляем row.name локально, чтобы таблица отразила изменение без
+// перезапроса всего списка компаний.
+function onCompanySaved({ companyId, name }) {
+    const row = companies.value.find((c) => c.id === companyId);
+    if (!row) return;
+    row.name = name;
 }
 
 // VNode-фабрика иконки "копировать" (две накладывающиеся карточки, контурный
@@ -381,14 +289,16 @@ function copyIconVNode() {
 }
 
 // Копирует JSON-снимок компании в системный буфер обмена и показывает
-// уведомление об успехе. Поля: name, url, emails, tier — порядок и состав
-// фиксированы, чтобы внешние потребители получали стабильную структуру.
+// уведомление об успехе. Поля: name, url, emails, tier, language —
+// порядок и состав фиксированы, чтобы внешние потребители получали
+// стабильную структуру. language = код текущего языка системы (en/de/ru/…).
 async function copyCompanyToClipboard(row) {
     const payload = {
         name: row.name,
         url: row.url,
         emails: Array.isArray(row.emails) ? row.emails : [],
         tier: row.tier ?? null,
+        language: languageStore.current,
     };
     await navigator.clipboard.writeText(JSON.stringify(payload, null, 2));
     notification.success({
@@ -470,7 +380,7 @@ const companyColumns = [
         // Каждый email — отдельная обёртка-flex: слева текст адреса
         // (с иконкой "уже отправлено", если есть запись в company_emails),
         // справа кнопка "редактировать" (карандаш). Клик открывает модалку
-        // редактирования через openEmailEdit(companyId, email).
+        // редактирования через emailModalRef.value.open(companyId, email).
         render: (row) => {
             if (!Array.isArray(row.emails) || !row.emails.length) return '';
             const sent = new Set(Array.isArray(row.sent_emails) ? row.sent_emails : []);
@@ -489,7 +399,7 @@ const companyColumns = [
                             secondary: true,
                             size: 'tiny',
                             class: 'email-row__edit-btn',
-                            onClick: () => openEmailEdit(row.id, email),
+                            onClick: () => emailModalRef.value?.open(row.id, email),
                         },
                         { default: () => pencilIconVNode() },
                     ),
@@ -522,7 +432,7 @@ const companyColumns = [
                     {
                         quaternary: true,
                         class: 'company-edit-btn',
-                        onClick: () => editCompany(row.id),
+                        onClick: () => companyModalRef.value?.open(row.id, row.name),
                     },
                     { default: () => pencilIconVNode() },
                 ),
@@ -662,6 +572,8 @@ async function sendQuery() {
         search_query_id: searchQueryId.value,
     }
 
+    console.log('sendQuery');
+
     const response = await apiAxios.post('/query', params);
 
     console.log('response', response);
@@ -683,23 +595,6 @@ async function checkJobStatus() {
     }
 }
 
-// Запланировать следующую проверку статуса очередей с задержкой,
-// зависящей от текущего isRunning. Когда состояние меняется (например,
-// после sendQuery — running ставит true), цепочка автоматически переходит
-// на быстрый интервал.
-function scheduleNextJobStatusCheck() {
-    if (jobStatusTimer !== null) {
-        clearTimeout(jobStatusTimer);
-    }
-
-    const delay = isRunning.value ? POLL_RUNNING_MS : POLL_IDLE_MS;
-
-    jobStatusTimer = setTimeout(async () => {
-        await checkJobStatus();
-        scheduleNextJobStatusCheck();
-    }, delay);
-}
-
 // SERVER - тихий ежедневный бэкап БД.
 // На бэке идемпотентно по дате: если файл backup_YYYY-MM-DD.sql уже есть —
 // сервер просто вернёт reason=already_exists, ничего не пересоздавая.
@@ -715,9 +610,10 @@ async function ensureDailyBackup() {
 // SERVER - подгружает все типы бизнеса
 async function loadTypeBusinesses() {
     optionsLoading.value = true;
+
     const response = await apiAxios.get('/type-businesses');
 
-    console.log(response)
+    console.log("loadTypeBusinesses ", response)
 
     if(response?.status === "success"){
         const {items} = response?.data
@@ -800,13 +696,6 @@ async function saveSearchQuery() {
     searchSaving.value = false;
 }
 
-// Включить режим редактирования существующего SearchQuery (карандашная
-// кнопка справа от input'а). Input разблокируется, кнопка превращается
-// в "Сохранить" → updateSearchQuery.
-function enterSearchEdit() {
-    searchEditing.value = true;
-}
-
 // SERVER - PUT /search-queries/{id} с новым text.
 async function updateSearchQuery() {
     const text = searchQueryText.value.trim();
@@ -832,24 +721,6 @@ async function updateSearchQuery() {
     searchSaving.value = false;
 }
 
-// Enter в input'е — в зависимости от режима либо создаёт новую запись,
-// либо обновляет существующую (если включён режим редактирования).
-function onSearchQueryEnter() {
-    if (hasSearchQuery.value) {
-        if (searchEditing.value) updateSearchQuery();
-    } else {
-        saveSearchQuery();
-    }
-}
-
-// Сброс состояния SearchQuery: для случаев "тип бизнеса не выбран"
-// или "для пары пока нет SearchQuery в БД".
-function resetSearchQueryState() {
-    searchQueryId.value = null;
-    searchQueryText.value = '';
-    searchEditing.value = false;
-}
-
 // SERVER - подгружает список компаний для конкретного SearchQuery.
 // Если бэкенд возвращает пустой массив — на фронте таблица скрыта
 // (через v-if="companies.length" в шаблоне).
@@ -871,9 +742,8 @@ async function loadCompanies(searchQueryIdValue) {
     }
 }
 
-// Мягкое удаление: бэкенд проставляет deleted_at, запись остаётся в БД.
+// SERVER - Мягкое удаление
 // На фронте просто убираем строку из локального списка — таблица сама
-// перерисуется (а если companies опустеет, исчезнет по v-if).
 async function deleteCompany(id) {
     const response = await apiAxios.destroy(`/companies/${id}`);
     if (response?.status === 'success') {
@@ -881,90 +751,47 @@ async function deleteCompany(id) {
     }
 }
 
-// SERVER - сохраняет письмо для пары (company_id + email) в таблицу
-async function sendEmailLetter() {
-    const letter = editingLetter.value.trim();
-    if (!letter || emailSending.value || !editingCompanyId.value) return;
-
-    emailSending.value = true;
-
-    const params = {
-        company_id: editingCompanyId.value,
-        email: editingEmail.value,
-        letter,
-    };
-
-    const response = await apiAxios.post('/company-emails', params);
-
-    if (response?.status === 'success') {
-        notification.success({
-            content: response.message,
-            duration: 5000,
-            keepAliveOnHover: true,
-        });
-        // Локально отметим email как "уже отправленный" — иконка появится
-        // сразу, без перезагрузки списка компаний.
-        const row = companies.value.find((c) => c.id === editingCompanyId.value);
-        if (row) {
-            const sent = Array.isArray(row.sent_emails) ? row.sent_emails : [];
-            if (!sent.includes(editingEmail.value)) {
-                row.sent_emails = [...sent, editingEmail.value];
-            }
-        }
-        // Добавляем только что отправленное письмо в начало истории.
-        // Бэкенд не возвращает item — собираем синтетический локально,
-        // чтобы гармошка обновилась без повторного запроса. id отрицательный
-        // (Date.now() со знаком минус), чтобы не конфликтовал с реальными.
-        letterHistory.value = [
-            {
-                id: -Date.now(),
-                letter,
-                created_at: new Date().toISOString(),
-            },
-            ...letterHistory.value,
-        ];
-        showEmailModal.value = false;
+// Запланировать следующую проверку статуса очередей с задержкой,
+// зависящей от текущего isRunning. Когда состояние меняется (например,
+// после sendQuery — running ставит true), цепочка автоматически переходит
+// на быстрый интервал.
+function scheduleNextJobStatusCheck() {
+    if (jobStatusTimer !== null) {
+        clearTimeout(jobStatusTimer);
     }
 
-    emailSending.value = false;
+    const delay = isRunning.value ? POLL_RUNNING_MS : POLL_IDLE_MS;
+
+    jobStatusTimer = setTimeout(async () => {
+        await checkJobStatus();
+        scheduleNextJobStatusCheck();
+    }, delay);
 }
 
-// Открывает модалку редактирования компании. Берём актуальную row из
-// companies — так и текущее name подставится в input, и при сохранении
-// сможем мутировать ровно тот же объект (таблица обновится).
-function editCompany(id) {
-    const row = companies.value.find((c) => c.id === id);
-    if (!row) return;
-
-    editingCompanyForName.value = row;
-    editingCompanyName.value = row.name ?? '';
-    showCompanyModal.value = true;
-}
-
-// SERVER - PUT /companies/{id} с новым name. На успехе локально обновляем
-// row, чтобы таблица отразила изменение без перезапроса всего списка.
-async function saveCompanyName() {
-    const row = editingCompanyForName.value;
-    const name = editingCompanyName.value.trim();
-    if (!row || !name || companySaving.value) return;
-
-    companySaving.value = true;
-
-    const response = await apiAxios.put(`/companies/${row.id}`, { name });
-
-    if (response?.status === 'success') {
-        notification.success({
-            content: response.message,
-            duration: 5000,
-            keepAliveOnHover: true,
-        });
-        row.name = response?.data?.item?.name ?? name;
-        showCompanyModal.value = false;
+// Enter в input'е — в зависимости от режима либо создаёт новую запись,
+// либо обновляет существующую (если включён режим редактирования).
+function onSearchQueryEnter() {
+    if (hasSearchQuery.value) {
+        if (searchEditing.value) updateSearchQuery();
+    } else {
+        saveSearchQuery();
     }
-
-    companySaving.value = false;
 }
 
+// Сброс состояния SearchQuery: для случаев "тип бизнеса не выбран"
+// или "для пары пока нет SearchQuery в БД".
+function resetSearchQueryState() {
+    searchQueryId.value = null;
+    searchQueryText.value = '';
+    searchEditing.value = false;
+}
+
+// Включить режим редактирования существующего SearchQuery (карандашная
+// кнопка справа от input'а). Input разблокируется, кнопка превращается
+// в "Сохранить" → updateSearchQuery.
+function enterSearchEdit() {
+    searchEditing.value = true;
+}
 // ============================================================
 // LIFECYCLE
 // ============================================================
@@ -1118,29 +945,12 @@ onBeforeUnmount(() => {
         }
     }
 }
-
-
 .svg-eye{
     path{
         fill: $color-green-700;
     }
 }
 
-.email-modal-body {
-    &__history {
-        margin-bottom: 16px;
-    }
-    // Сохраняем переносы строк, но также переносим длинные строки/слова,
-    // чтобы текст не вылезал по горизонтали из панели гармошки.
-    &__letter {
-        margin: 0;
-        white-space: pre-wrap;
-        word-break: break-word;
-        overflow-wrap: anywhere;
-        font-family: inherit;
-        font-size: 13px;
-    }
-}
 :deep(.n-form-item) {
     flex: 1 1 auto;
 }

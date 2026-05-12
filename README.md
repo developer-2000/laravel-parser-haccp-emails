@@ -21,6 +21,8 @@ docker compose -f dev-compose.yml exec app npm run build
 
 docker compose -f dev-compose.yml exec app php artisan migrate:fresh --seed
 docker compose -f dev-compose.yml exec app php artisan migrate
+
+docker compose -f dev-compose.yml restart queue
 ```
 
 docker compose -f dev-compose.yml ps

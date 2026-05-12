@@ -14,6 +14,10 @@ export const useLanguageStore = defineStore('language', {
         current: null,
         loading: false,
         loaded: false,
+        // Кэш in-flight промиса load(). Нужен чтобы конкурентные вызовы
+        // (App.vue parent + Home.vue child в одном тике) дождались одного
+        // и того же запроса GET /languages, а не отвалились на guard'е сразу.
+        _loadPromise: null,
     }),
 
     getters: {
@@ -35,32 +39,44 @@ export const useLanguageStore = defineStore('language', {
          * Грузит список языков с бэка один раз за сессию SPA.
          * Восстанавливает выбор из localStorage, при расхождении с серверной сессией —
          * подтягивает её под выбор пользователя.
+         *
+         * Идемпотентна и safe для конкурентных вызовов: если запрос уже летит,
+         * повторный await дождётся того же промиса вместо того, чтобы отвалиться
+         * на guard'е (иначе current=null уезжает в зависимые запросы).
          */
-        async load() {
-            if (this.loaded || this.loading) return;
-            this.loading = true;
+        load() {
+            if (this.loaded) return Promise.resolve();
+            if (this._loadPromise) return this._loadPromise;
 
-            const data = await apiAxios.get('/languages');
-            this.loading = false;
+            this._loadPromise = (async () => {
+                this.loading = true;
+                try {
+                    const data = await apiAxios.get('/languages');
+                    if (data?.status !== 'success') return;
 
-            if (data?.status !== 'success') return;
+                    const { languages, current: serverCurrent } = data.data;
 
-            const { languages, current: serverCurrent } = data.data;
+                    this.languages = languages;
 
-            this.languages = languages;
+                    const stored = localStorage.getItem(STORAGE_KEY);
+                    // Если сохраненный есть и он есть в массиве языков
+                    const storedIsValid = stored && languages.some((l) => l.code === stored);
+                    // Сохраненный или по умолчанию язык
+                    this.current = storedIsValid ? stored : serverCurrent;
 
-            const stored = localStorage.getItem(STORAGE_KEY);
-            // Если сохраненный есть и он есть в массиве языков
-            const storedIsValid = stored && languages.some((l) => l.code === stored);
-            // Сохраненный или по умолчанию язык
-            this.current = storedIsValid ? stored : serverCurrent;
+                    // Если сохраненный и по умолчанию языки разные
+                    if (storedIsValid && stored !== serverCurrent) {
+                        await this.persist(stored);
+                    }
 
-            // Если сохраненный и по умолчанию языки разные
-            if (storedIsValid && stored !== serverCurrent) {
-                await this.persist(stored);
-            }
+                    this.loaded = true;
+                } finally {
+                    this.loading = false;
+                    this._loadPromise = null;
+                }
+            })();
 
-            this.loaded = true;
+            return this._loadPromise;
         },
 
         /**

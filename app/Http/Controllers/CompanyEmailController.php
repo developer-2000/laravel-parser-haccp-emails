@@ -4,7 +4,10 @@ namespace App\Http\Controllers;
 
 use App\Http\Requests\IndexCompanyEmailRequest;
 use App\Http\Requests\StoreCompanyEmailRequest;
+use App\Jobs\SendCompanyLetterJob;
+use App\Models\Company;
 use App\Models\CompanyEmail;
+use App\Services\AppLogger;
 use Illuminate\Http\JsonResponse;
 
 class CompanyEmailController extends BaseController
@@ -21,9 +24,10 @@ class CompanyEmailController extends BaseController
             ->where('company_id', $data['company_id'])
             ->where('email', $data['email'])
             ->orderByDesc('id')
-            ->get(['id', 'letter', 'created_at'])
+            ->get(['id', 'title', 'letter', 'created_at'])
             ->map(fn ($e) => [
                 'id'         => $e->id,
+                'title'      => $e->title,
                 'letter'     => $e->letter,
                 'created_at' => $e->created_at?->toIso8601String(),
             ])
@@ -45,8 +49,28 @@ class CompanyEmailController extends BaseController
         $item = CompanyEmail::query()->create([
             'company_id' => $data['company_id'],
             'email'      => $data['email'],
+            'title'      => $data['title'],
             'letter'     => $data['letter'],
         ]);
+
+        // Имя компании нужно для приветствия в шаблоне. Если name пустой
+        // (например, парсер не нашёл title) — передаём пустую строку, шаблон
+        // отрендерит обезличенное "Здравствуйте!".
+        $companyName = (string) (Company::query()
+            ->whereKey($data['company_id'])
+            ->value('name') ?? '');
+
+        SendCompanyLetterJob::dispatch(
+            $data['email'],
+            $companyName,
+            $data['title'],
+            $data['letter'],
+        );
+
+        app(AppLogger::class)->writeFile(
+            "Отправлено письмо на {$data['email']} | title=\"{$data['title']}\"",
+            'send_mail.log',
+        );
 
         return $this->getSuccessResponse('Сообщение отправлено!');
     }

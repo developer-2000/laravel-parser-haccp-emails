@@ -223,17 +223,33 @@ return [
             // ОБЯЗАТЕЛЬНО: timeout < retry_after в config/queue.php.
             'timeout' => 600,
         ],
+        // Очередь для рассылки писем компаниям. Инфраструктура заведена
+        // заранее, сами SMTP-настройки и Mailable будут добавлены позже.
+        // tries=3 — SMTP может моргнуть (rate-limit, временный сбой DNS);
+        // timeout=60 — обычный handshake + send укладывается в секунды.
+        'mail' => [
+            'connection' => 'redis',
+            'queue' => ['mail'],
+            'balance' => 'simple',
+            'minProcesses' => 1,
+            'maxProcesses' => 2,
+            'memory' => 256,
+            'tries' => 3,
+            'timeout' => 60,
+        ],
     ],
 
     'environments' => [
         'production' => [
             'search' => ['maxProcesses' => 3],
             'crawl'  => ['maxProcesses' => 10],
+            'mail'   => ['maxProcesses' => 3],
         ],
 
         'local' => [
             'search' => ['maxProcesses' => 2],
             'crawl'  => ['maxProcesses' => 5],
+            'mail'   => ['maxProcesses' => 1],
         ],
     ],
 

@@ -22,6 +22,7 @@ class StoreCompanyEmailRequest extends FormRequest
         return [
             'company_id' => ['required', 'integer', 'exists:companies,id'],
             'email'      => ['required', 'string', 'email', 'max:255'],
+            'title'      => ['required', 'string', 'max:255'],
             'letter'     => ['required', 'string'],
         ];
     }

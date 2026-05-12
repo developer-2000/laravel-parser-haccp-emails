@@ -10,6 +10,7 @@ class CompanyEmail extends Model
     protected $fillable = [
         'company_id',
         'email',
+        'title',
         'letter',
     ];
 
