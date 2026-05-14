@@ -4,6 +4,7 @@ namespace App\Services;
 
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
+use PDO;
 
 class BackupService
 {
@@ -29,9 +30,33 @@ class BackupService
             File::makeDirectory($dir, 0755, true);
         }
 
+        // 1 Создать dump DB
         $this->dump($file);
+        // 2 Оставить только 3 самых свежих dump
+        $this->rotate($dir);
 
         return ['done' => true, 'file' => $file, 'reason' => 'created'];
+    }
+
+    /**
+     * Оставляет $keep самых свежих бэкапов в каталоге, остальные удаляет.
+     *
+     * Имена файлов имеют вид backup_YYYY-MM-DD.sql, поэтому лексикографическая
+     * сортировка совпадает с хронологической.
+     */
+    private function rotate(string $dir): void
+    {
+        $keep = 3;
+        $files = glob($dir . DIRECTORY_SEPARATOR . 'backup_*.sql');
+        if ($files === false || count($files) <= $keep) {
+            return;
+        }
+
+        sort($files);
+        $toDelete = array_slice($files, 0, count($files) - $keep);
+        foreach ($toDelete as $old) {
+            File::delete($old);
+        }
     }
 
     /**
@@ -58,7 +83,7 @@ class BackupService
 
             $pdo = DB::connection()->getPdo();
 
-            $tables = $pdo->query('SHOW TABLES')->fetchAll(\PDO::FETCH_COLUMN);
+            $tables = $pdo->query('SHOW TABLES')->fetchAll(PDO::FETCH_COLUMN);
 
             foreach ($tables as $table) {
                 $this->dumpTable($pdo, $handle, $table);
@@ -73,7 +98,7 @@ class BackupService
     /**
      * Дампит структуру одной таблицы (DROP + CREATE) и её данные пачками INSERT.
      */
-    private function dumpTable(\PDO $pdo, $handle, string $table): void
+    private function dumpTable(PDO $pdo, $handle, string $table): void
     {
         $tableQuoted = '`' . str_replace('`', '``', $table) . '`';
 
@@ -82,7 +107,7 @@ class BackupService
         fwrite($handle, "-- ----------------------------\n");
         fwrite($handle, "DROP TABLE IF EXISTS {$tableQuoted};\n");
 
-        $createRow = $pdo->query("SHOW CREATE TABLE {$tableQuoted}")->fetch(\PDO::FETCH_ASSOC);
+        $createRow = $pdo->query("SHOW CREATE TABLE {$tableQuoted}")->fetch(PDO::FETCH_ASSOC);
         $createSql = $createRow['Create Table'] ?? '';
         if ($createSql === '') {
             return;
@@ -97,7 +122,7 @@ class BackupService
         // Тащим строки порциями по 1000 (через unbuffered statement) и пишем
         // INSERT'ами по 200 значений — баланс между размером SQL-запроса и
         // количеством отдельных операторов.
-        $stmt = $pdo->query("SELECT * FROM {$tableQuoted}", \PDO::FETCH_ASSOC);
+        $stmt = $pdo->query("SELECT * FROM {$tableQuoted}", PDO::FETCH_ASSOC);
 
         $batch = [];
         $columnsList = null;
@@ -140,7 +165,7 @@ class BackupService
      * NULL → NULL, остальное — через PDO::quote (одинарные кавычки + escaping).
      * bool → 0/1, потому что MySQL хранит как TINYINT(1).
      */
-    private function quoteValue(\PDO $pdo, $value): string
+    private function quoteValue(PDO $pdo, $value): string
     {
         if ($value === null) {
             return 'NULL';
