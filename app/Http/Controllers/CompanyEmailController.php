@@ -67,11 +67,6 @@ class CompanyEmailController extends BaseController
             $data['letter'],
         );
 
-        app(AppLogger::class)->writeFile(
-            "Отправлено письмо на {$data['email']} | title=\"{$data['title']}\"",
-            'send_mail.log',
-        );
-
-        return $this->getSuccessResponse('Сообщение отправлено!');
+        return $this->getSuccessResponse('Письмо поставлено в очередь');
     }
 }
