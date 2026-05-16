@@ -4,7 +4,6 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
-use Illuminate\Database\Eloquent\Relations\HasMany;
 
 class SearchQuery extends Model
 {
@@ -35,13 +34,5 @@ class SearchQuery extends Model
     public function typeBusiness(): BelongsTo
     {
         return $this->belongsTo(TypeBusiness::class);
-    }
-
-    /**
-     * Конфигурации (наборы) поиска, использующие этот запрос.
-     */
-    public function querySets(): HasMany
-    {
-        return $this->hasMany(QuerySet::class);
     }
 }

@@ -2,7 +2,6 @@
 
 namespace App\Services;
 
-use App\Models\AppLog;
 use Illuminate\Support\Facades\File;
 
 class AppLogger
@@ -24,26 +23,6 @@ class AppLogger
         $flags = $reset ? LOCK_EX : (FILE_APPEND | LOCK_EX);
 
         return file_put_contents($path, $line, $flags) !== false;
-    }
-
-    /**
-     * Записать сообщение в таблицу app_logs.
-     *
-     * @param string|array $message Сообщение (массив сериализуется в JSON, потом обрезается до 255 символов).
-     * @param array|null   $context Доп. данные, попадают в поле context (json).
-     * @return bool Успех записи.
-     */
-    public function writeDb(string|array $message, ?array $context = null): bool
-    {
-        try {
-            AppLog::query()->create([
-                'message' => mb_substr($this->stringify($message), 0, 255),
-                'context' => $context,
-            ]);
-            return true;
-        } catch (\Throwable) {
-            return false;
-        }
     }
 
     /**

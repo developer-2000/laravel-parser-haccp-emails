@@ -404,7 +404,7 @@ class CrawlJob implements ShouldQueue
     {
         preg_match_all(self::EMAIL_REGEX, $html, $matches);
 
-        return $matches[0] ?? [];
+        return $matches[0];
     }
 
     /**
@@ -430,7 +430,7 @@ class CrawlJob implements ShouldQueue
 
         preg_match_all(self::EMAIL_REGEX, $normalized, $matches);
 
-        return $matches[0] ?? [];
+        return $matches[0];
     }
 
     /**
@@ -553,7 +553,7 @@ class CrawlJob implements ShouldQueue
         $decoded = html_entity_decode($html, ENT_QUOTES | ENT_HTML5, 'UTF-8');
         preg_match_all(self::EMAIL_REGEX, $decoded, $matches);
 
-        return $matches[0] ?? [];
+        return $matches[0];
     }
 
     /**

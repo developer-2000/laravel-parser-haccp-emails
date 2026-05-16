@@ -211,6 +211,7 @@ const pagination = reactive({
     pageSizes: PAGE_SIZES,
     onChange: (page) => {
         pagination.page = page;
+        window.scrollTo({ top: 0, behavior: 'smooth' });
     },
     onUpdatePageSize: (pageSize) => {
         pagination.pageSize = pageSize;
@@ -572,11 +573,7 @@ async function sendQuery() {
         search_query_id: searchQueryId.value,
     }
 
-    console.log('sendQuery');
-
     const response = await apiAxios.post('/query', params);
-
-    console.log('response', response);
 
     loading.value = false;
 
@@ -612,8 +609,6 @@ async function loadTypeBusinesses() {
     optionsLoading.value = true;
 
     const response = await apiAxios.get('/type-businesses');
-
-    console.log("loadTypeBusinesses ", response)
 
     if(response?.status === "success"){
         const {items} = response?.data
