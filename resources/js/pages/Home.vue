@@ -171,6 +171,7 @@ const TYPE_BUSINESS_KEY = 'home.typeBusinessId';
 // localStorage (а не sessionStorage), чтобы выбор пережил перезагрузку
 // и закрытие вкладки — это долгоживущее UX-предпочтение.
 const PAGE_SIZE_KEY = 'home.companies.pageSize';
+const PAGE_KEY = 'home.companies.page';
 const PAGE_SIZES = [10, 20, 50, 100];
 
 // Восстанавливаем pageSize из localStorage. Защита от мусора:
@@ -181,6 +182,15 @@ function readStoredPageSize() {
     const raw = localStorage.getItem(PAGE_SIZE_KEY);
     const num = Number(raw);
     return Number.isFinite(num) && PAGE_SIZES.includes(num) ? num : 10;
+}
+
+// Восстанавливаем номер страницы из localStorage. Фактическая валидность
+// (page <= totalPages) проверяется позже watcher'ом, когда companies
+// загрузятся — здесь только защита от мусора в storage.
+function readStoredPage() {
+    const raw = localStorage.getItem(PAGE_KEY);
+    const num = Number(raw);
+    return Number.isFinite(num) && num >= 1 ? Math.floor(num) : 1;
 }
 
 // ============================================================
@@ -205,12 +215,13 @@ const showDeleted = ref(false);
 // show-size-picker рендерит селектор справа от пагинации в одной строке;
 // центрирование всей группы — через :deep CSS ниже.
 const pagination = reactive({
-    page: 1,
+    page: readStoredPage(),
     pageSize: readStoredPageSize(),
     showSizePicker: true,
     pageSizes: PAGE_SIZES,
     onChange: (page) => {
         pagination.page = page;
+        localStorage.setItem(PAGE_KEY, String(page));
         window.scrollTo({ top: 0, behavior: 'smooth' });
     },
     onUpdatePageSize: (pageSize) => {
@@ -218,7 +229,22 @@ const pagination = reactive({
         pagination.page = 1;
         // Запоминаем выбор, чтобы пережил перезагрузку страницы.
         localStorage.setItem(PAGE_SIZE_KEY, String(pageSize));
+        localStorage.setItem(PAGE_KEY, '1');
     },
+});
+
+// Когда companies загрузились, проверяем что сохранённая страница ещё валидна.
+// Сценарии для отката на 1: данные изменились (стало меньше строк), сменился
+// pageSize, либо в localStorage сохранена страница из чужого контекста.
+// Не трогаем pagination.page пока companies пуст — таблица скрыта,
+// корректировать нечего.
+watch([() => companies.value.length, () => pagination.pageSize], ([len, size]) => {
+    if (!len) return;
+    const total = Math.max(1, Math.ceil(len / size));
+    if (pagination.page > total) {
+        pagination.page = 1;
+        localStorage.setItem(PAGE_KEY, '1');
+    }
 });
 
 // Ссылка на модалку отправки письма — открываем через
@@ -538,6 +564,14 @@ watch(typeBusinessId, (val) => {
     } else {
         resetSearchQueryState();
     }
+});
+
+// Смена типа бизнеса означает новый контекст списка компаний — сохранённая
+// страница теряет смысл. Откатываем на 1 и чистим память, чтобы при следующем
+// заходе на эту страницу пагинация начиналась с начала.
+watch(typeBusinessId, () => {
+    pagination.page = 1;
+    localStorage.removeItem(PAGE_KEY);
 });
 
 // при смене языка — то же самое
